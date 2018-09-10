@@ -1548,6 +1548,29 @@ def configure_extension_build() -> tuple[
         main_libraries = ["torch"]
         main_sources = []
 
+    CUDA_HOME = os.getenv('CUDA_HOME')
+
+    if cmake_cache_vars['USE_CUDA']:
+        if IS_WINDOWS:
+            cuda_lib_path = CUDA_HOME + '/lib/x64/'
+        else:
+            cuda_lib_dirs = ['lib64', 'lib']
+            for lib_dir in cuda_lib_dirs:
+                cuda_lib_path = os.path.join(CUDA_HOME, lib_dir)
+                if os.path.exists(cuda_lib_path):
+                    break
+            
+            # Bug 200447818
+            # /usr/local/cuda/compat/lib is where NGC containers put the compat libcuda.
+            # If this isn't here, then below where we add the location of libcudnn to the
+            # rpath, we're implicitly also adding the location of libcuda to the rpath,
+            # which ignores LD_LIBRARY_PATH, and boom
+            cuda_compat_path = os.getenv('_CUDA_COMPAT_PATH')
+            if cuda_compat_path is not None and os.path.exists(cuda_compat_path):
+                extra_link_args.insert(0, '-Wl,-rpath,' + os.path.join(cuda_compat_path, 'lib'))
+
+        library_dirs.append(cuda_lib_path)
+
     if build_type.is_debug():
         if IS_WINDOWS:
             extra_compile_args += ["/Z7"]

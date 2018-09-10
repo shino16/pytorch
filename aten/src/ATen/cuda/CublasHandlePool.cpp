@@ -97,10 +97,10 @@ void destroyCublasHandle(cublasHandle_t handle) {
 // happens in fbcode setting. @colesbury and @soumith decided to not destroy
 // the handle as a workaround.
 //   - Comments of @soumith copied from cuDNN handle pool implementation
-#ifdef NO_CUDNN_DESTROY_HANDLE
-#else
-  cublasDestroy(handle);
-#endif
+// #ifdef NO_CUDNN_DESTROY_HANDLE
+// #else
+//     cublasDestroy(handle);
+// #endif
 }
 
 using CuBlasPoolType = DeviceThreadHandlePool<cublasHandle_t, createCublasHandle, destroyCublasHandle>;
