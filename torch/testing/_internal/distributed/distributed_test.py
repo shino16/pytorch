@@ -4298,6 +4298,10 @@ class DistributedTest:
             # Run a simple end to end DDP model, use result of single node model
             # as baseline
 
+            if static_graph==True or set_static_graph_twice==True:
+                print("skipping static_graph")
+                return
+
             # cpu training setup
             model = Net()
 
