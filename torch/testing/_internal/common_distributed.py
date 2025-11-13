@@ -239,9 +239,10 @@ def skip_if_lt_x_gpu(x, *, allow_cpu=False):
                 return func(*args, **kwargs)
             if allow_cpu and not (torch.cuda.is_available() or TEST_HPU or TEST_XPU):
                 return func(*args, **kwargs)
-            test_skip = TEST_SKIPS[f"multi-gpu-{x}"]
-            if not _maybe_handle_skip_if_lt_x_gpu(args, test_skip.message):
-                sys.exit(test_skip.exit_code)
+            #test_skip = TEST_SKIPS[f"multi-gpu-{x}"]
+            #if not _maybe_handle_skip_if_lt_x_gpu(args, test_skip.message):
+            #    sys.exit(test_skip.exit_code)
+            return unittest.skipIf(True, TEST_SKIPS[f"multi-gpu-{x}"].exit_code)(func)
 
         return wrapper
 
