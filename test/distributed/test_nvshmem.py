@@ -14,6 +14,8 @@ from torch.testing._internal.common_distributed import (
     MultiProcContinuousTest,
     skip_if_lt_x_gpu,
 )
+from torch.testing._internal.common_cuda import SM100OrLater
+from torch.testing._internal.common_utils import xfailIf
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
@@ -779,6 +781,8 @@ class NVSHMEMTileCommTest(MultiProcContinuousTest):
 
     @skipIfRocm
     @requires_nvls()
+    # TODO: remove when B5688851 and B5676312
+    @xfailIf(not SM100OrLater)
     @parametrize("tile_size", [32, 128, 512])
     @parametrize("dtype", [torch.float, torch.half, torch.bfloat16])
     def test_tile_reduce(self, tile_size: int, dtype: torch.dtype) -> None:
@@ -815,6 +819,8 @@ class NVSHMEMTileCommTest(MultiProcContinuousTest):
         torch.testing.assert_close(full_out, expected)
 
     @skipIfRocm
+    # TODO: remove when B5688851 and B5676312
+    @xfailIf(not SM100OrLater)
     @requires_nvls()
     @parametrize("tile_size", [32, 128, 512])
     @parametrize(
