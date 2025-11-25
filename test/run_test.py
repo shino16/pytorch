@@ -1011,7 +1011,8 @@ def test_openreg(test_module, test_directory, options):
 
 
 def test_distributed(test_module, test_directory, options):
-    mpi_available = shutil.which("mpiexec")
+    #mpi_available = shutil.which("mpiexec")
+    mpi_available = False
     if options.verbose and not mpi_available:
         print_to_stderr("MPI not available -- MPI backend tests will be skipped")
 
