@@ -21,6 +21,7 @@ from torch.nn.functional import (
 )
 from torch.testing._internal.common_cuda import (
     IS_SM90,
+    IS_THOR,
     _get_torch_cuda_version,
     PLATFORM_SUPPORTS_FP8,
     PLATFORM_SUPPORTS_FP8_GROUPED_GEMM,
@@ -1893,7 +1894,7 @@ class TestFP8Matmul(TestCase):
             raise unittest.SkipTest("nvfp4 not supported on ROCm, skipping")
         if (recipe == "nvfp4" or recipe == "mxfp4") and fast_accum:
             raise unittest.SkipTest("fast_accum not supported in nvfp4/mxfp4 cublas gemm, skipping")
-        if recipe == "mxfp4" and SM120OrLater:
+        if recipe == "mxfp4" and (IS_THOR or SM120OrLater):
             raise unittest.SkipTest("MXFP4 on CUDA only supported on B200/B300")
 
         device = "cuda"
