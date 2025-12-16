@@ -32,6 +32,7 @@
 #include <thrust/sort.h>
 #include <thrust/system/cuda/execution_policy.h>
 #include <thrust/transform.h>
+#include <thrust/pair.h>
 #include <thrust/unique.h>
 #include <thrust/system/cuda/execution_policy.h>
 #include <c10/macros/Macros.h>
