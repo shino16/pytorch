@@ -382,7 +382,7 @@ IF(USE_MSLK)
     foreach(cu_file ${mslk_native_cuda_cu})
       _BUILD_FOR_ADDITIONAL_ARCHS(
         "${cu_file}"
-        "100a;103a;110a")
+        "100a;103a;107a;110a")
     endforeach()
 
     file(GLOB_RECURSE mslk_native_cuda_cpp

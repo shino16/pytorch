@@ -113,6 +113,12 @@ if(INTERN_BUILD_ATEN_OPS)
             list(APPEND _file_compile_flags "-gencode;arch=compute_103a,code=sm_103a")
           endif()
         endif()
+        # We will need to gate against CUDA version, because sm_107a is available on CUDA 13.x+
+        if("${_arch}" STREQUAL "107a" AND CUDA_VERSION VERSION_GREATER_EQUAL 13.0)
+          if(_existing_arch_flags MATCHES ".*compute_100.*")
+            list(APPEND _file_compile_flags "-gencode;arch=compute_107a,code=sm_107a")
+          endif()
+        endif()
         # We will need to gate against CUDA version, because sm_110a is available on CUDA 13.0+
         if("${_arch}" STREQUAL "110a" AND CUDA_VERSION VERSION_GREATER_EQUAL 13.0)
           if(_existing_arch_flags MATCHES ".*compute_110.*")
@@ -138,13 +144,13 @@ if(INTERN_BUILD_ATEN_OPS)
 
     _BUILD_FOR_ADDITIONAL_ARCHS(
       "${CMAKE_CURRENT_LIST_DIR}/../aten/src/ATen/native/cuda/RowwiseScaledMM.cu"
-      "89;90a;100a;103a;110a;120a;121a")
+      "89;90a;100a;103a;107a;110a;120a;121a")
     _BUILD_FOR_ADDITIONAL_ARCHS(
       "${CMAKE_CURRENT_LIST_DIR}/../aten/src/ATen/native/cuda/ScaledGroupMM.cu"
       "90a")
     _BUILD_FOR_ADDITIONAL_ARCHS(
       "${CMAKE_CURRENT_LIST_DIR}/../aten/src/ATen/native/cuda/GroupMM.cu"
-      "90a;100a;103a;110a")
+      "90a;100a;103a;107a;110a")
 
   endif()
 
