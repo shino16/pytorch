@@ -49,6 +49,7 @@ from torch.fx.passes.reinplace import _is_view_op
 from torch.utils._mode_utils import no_dispatch
 from torch.utils._ordered_set import OrderedSet
 from torch.utils._sympy.numbers import int_oo
+from torch.utils._sympy.functions import Mod
 
 from . import config, ir, metrics
 from .codegen.common import (
@@ -376,6 +377,7 @@ class GraphLowering(torch.fx.Interpreter):
         self.bound_unbacked_symbols = OrderedSet[sympy.Symbol]()
 
         self.sizevars = SizeVarAllocator(shape_env)
+        self._apply_divisible_constraints()
         self.graph_input_names: list[str] = []
         self.graph_inputs: dict[str, Union[TensorBox, TorchBindObject, sympy.Expr]] = {}
         self.graph_inputs_original: dict[str, InputBuffer] = {}
@@ -538,11 +540,7 @@ class GraphLowering(torch.fx.Interpreter):
         for rs in shape_env.deferred_runtime_asserts.values():
             for runtime_assert in rs:
                 expr = runtime_assert.expr
-                if isinstance(expr, sympy.Equality):
-                    lhs, rhs = expr.lhs, expr.rhs
-                    if rhs == 0 and isinstance(lhs, Mod):
-                        shape_env._add_divisible(lhs)
-                elif isinstance(expr, sympy.Le):
+                if isinstance(expr, (sympy.Le, sympy.Ge)):
                     shape_env.guard_or_defer_runtime_assert(
                         expr, "range_hint_specialization"
                     )
