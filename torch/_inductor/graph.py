@@ -530,6 +530,23 @@ class GraphLowering(torch.fx.Interpreter):
         # Cache for dep size hints to avoid expensive recomputation
         self.dep_size_hint_cache: dict[tuple[Dep, bool], int] = {}
 
+    def _apply_divisible_constraints(self) -> None:
+        shape_env = self._shape_env
+        if shape_env is None:
+            return
+
+        for rs in shape_env.deferred_runtime_asserts.values():
+            for runtime_assert in rs:
+                expr = runtime_assert.expr
+                if isinstance(expr, sympy.Equality):
+                    lhs, rhs = expr.lhs, expr.rhs
+                    if rhs == 0 and isinstance(lhs, Mod):
+                        shape_env._add_divisible(lhs)
+                elif isinstance(expr, sympy.Le):
+                    shape_env.guard_or_defer_runtime_assert(
+                        expr, "range_hint_specialization"
+                    )
+
     def freeze_runtime_asserts(self) -> None:
         self._shape_env.freeze_runtime_asserts()
 
