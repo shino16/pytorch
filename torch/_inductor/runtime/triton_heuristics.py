@@ -2684,6 +2684,33 @@ def _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs: list[Conf
     return configs
 
 
+def _maybe_filter_configs_for_reduction_divisor(
+    inductor_meta, configs: list[Config]
+) -> list[Config]:
+    divisor = inductor_meta.get("reduction_numel_divisor")
+    if divisor is None or divisor <= 1 or not configs:
+        return configs
+    if inductor_meta.get("num_reduction", 0) != 1:
+        return configs
+
+    filtered_configs = []
+    for config in configs:
+        rblock = config.kwargs.get("R0_BLOCK")
+        if rblock is None or divisor % rblock == 0:
+            filtered_configs.append(config)
+
+    if filtered_configs:
+        log.debug(
+            "Filtering configs for reduction divisor=%d. Input configs size: %d. Output configs size: %d",
+            divisor,
+            len(configs),
+            len(filtered_configs),
+        )
+        return filtered_configs
+
+    return configs
+
+
 def pointwise(
     size_hints,
     triton_meta,
@@ -3309,6 +3336,7 @@ def reduction(
         num_dynamic=num_dynamic,
     )
 
+    configs = _maybe_filter_configs_for_reduction_divisor(inductor_meta, configs)
     configs = _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs)
     configs = filter_reduction_configs_for_determinism(inductor_meta, configs)
 
@@ -3366,6 +3394,7 @@ def cooperative_reduction(
         config.kwargs["RSPLIT"] = split
     # TODO(jansel): add more configs in max_autotune
 
+    configs = _maybe_filter_configs_for_reduction_divisor(inductor_meta, configs)
     configs = _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs)
     configs = filter_reduction_configs_for_determinism(inductor_meta, configs)
     return cached_autotune(

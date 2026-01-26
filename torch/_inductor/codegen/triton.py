@@ -5400,6 +5400,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             "num_reduction": self.num_reduction,
             **self.inductor_meta_common(),
         }
+        if self.num_reduction and len(self.get_reduction_prefixes()) == 1:
+            reduction_divisor = V.graph.sizevars.known_divisor(
+                self.features.reduction_numel
+            )
+            if reduction_divisor > 1:
+                inductor_meta["reduction_numel_divisor"] = reduction_divisor
 
         if self.mix_order_reduction:
             inductor_meta["RSPLIT_SIZE"] = self.rsplit_size
@@ -5788,6 +5794,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             max_block = 1
         else:
             max_block = self.max_block(tree.prefix)
+
+        if tree.is_reduction and not self.persistent_reduction:
+            known_divisor = V.graph.sizevars.known_divisor(tree.numel)
+            if known_divisor > 1:
+                pow2_divisor = known_divisor & -known_divisor
+                if pow2_divisor > 1:
+                    max_block = min(max_block, pow2_divisor)
 
         if tree.is_reduction and self.cooperative_reduction:
             max_block = max_block * self.max_rsplit()
