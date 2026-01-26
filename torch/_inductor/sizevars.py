@@ -1,5 +1,6 @@
 # mypy: allow-untyped-defs
 import functools
+import math
 import itertools
 import logging
 from collections import defaultdict
@@ -16,7 +17,7 @@ from torch.fx.experimental.symbolic_shapes import (
     ShapeEnv,
 )
 from torch.utils._ordered_set import OrderedSet
-from torch.utils._sympy.functions import FloorDiv, ModularIndexing
+from torch.utils._sympy.functions import FloorDiv, Mod, ModularIndexing
 from torch.utils._sympy.symbol import symbol_is_type, SymT
 from torch.utils._sympy.value_ranges import bound_sympy, IntInfinity, ValueRanges
 
@@ -393,8 +394,42 @@ class SizeVarAllocator:
         if len(free_symbols(numerator)) > 20:
             return False
 
+        if isinstance(denominator, (int, sympy.Integer)):
+            denominator_int = int(denominator)
+            if denominator_int != 0:
+                known_divisor = self.known_divisor(numerator)
+                if known_divisor is not None and known_divisor % denominator_int == 0:
+                    return True
+
         expr = sympy.Eq(numerator % denominator, 0)
         return self.statically_known_true(expr)  # type: ignore[arg-type]
+
+    def known_divisor(self, expr: Expr) -> int:
+        shape_env = self.shape_env
+        update_divisible = getattr(shape_env, "_update_divisible", None)
+        if callable(update_divisible):
+            update_divisible()
+        replace = getattr(shape_env, "replace", None)
+        if callable(replace):
+            expr = replace(expr)
+
+        lcm_divisor: Optional[int] = None
+        for divisible in getattr(shape_env, "divisible", ()):
+            if not isinstance(divisible, Mod):
+                continue
+            base, divisor = divisible.args
+            if callable(replace):
+                base = replace(base)
+            if base != expr:
+                continue
+            if isinstance(divisor, sympy.Integer):
+                divisor_int = int(divisor)
+                if divisor_int > 1:
+                    if lcm_divisor is None:
+                        lcm_divisor = divisor_int
+                    else:
+                        lcm_divisor = math.lcm(lcm_divisor, divisor_int)
+        return lcm_divisor or 1
 
     def statically_known_power_of_2(self, expr: Expr) -> bool:
         """
