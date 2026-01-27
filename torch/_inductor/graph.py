@@ -540,31 +540,14 @@ class GraphLowering(torch.fx.Interpreter):
         for rs in shape_env.deferred_runtime_asserts.values():
             for runtime_assert in rs:
                 expr = runtime_assert.expr
-                if not isinstance(expr, sympy.Equality):
-                    continue
-                lhs, rhs = expr.lhs, expr.rhs
-                if rhs != 0 or not isinstance(lhs, Mod):
-                    continue
-                shape_env._add_divisible(lhs)
-
-        for expr in list(shape_env.divisible):
-            if not isinstance(expr, Mod):
-                continue
-            symbol, divisor = expr.args
-            if not isinstance(symbol, sympy.Symbol) or not isinstance(
-                divisor, sympy.Integer
-            ):
-                continue
-            if symbol not in shape_env.var_to_val:
-                continue
-            hinted_val = shape_env.var_to_val[symbol]
-            if int(divisor) != int(hinted_val):
-                continue
-            guard_expr = sympy.Eq(symbol, divisor)
-            shape_env.guard_or_defer_runtime_assert(
-                guard_expr, "divisible_hint_specialization"
-            )
-            shape_env._set_replacement(symbol, divisor, "divisible_hint_specialization")
+                if isinstance(expr, sympy.Equality):
+                    lhs, rhs = expr.lhs, expr.rhs
+                    if rhs == 0 and isinstance(lhs, Mod):
+                        shape_env._add_divisible(lhs)
+                elif isinstance(expr, sympy.Le):
+                    shape_env.guard_or_defer_runtime_assert(
+                        expr, "range_hint_specialization"
+                    )
 
     def freeze_runtime_asserts(self) -> None:
         self._shape_env.freeze_runtime_asserts()
