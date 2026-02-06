@@ -2059,8 +2059,7 @@ class cutlass:
         os.environ.get(
             "TORCHINDUCTOR_CUTLASS_DIR",
             os.path.join(
-                os.path.dirname(torch.__file__),
-                "../third_party/cutlass/",
+                "/opt/pytorch/pytorch/third_party/cutlass/"
             ),
         )
     )
