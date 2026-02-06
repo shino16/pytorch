@@ -414,6 +414,18 @@ IF(USE_MSLK)
 
     # Add MSLK include directories for gemm_torch.h
     list(APPEND ATen_CUDA_INCLUDE ${MSLK_INCLUDE})
+
+    if(DEFINED ENV{{MSLK_MAX_JOBS})
+      if(CMAKE_GENERATOR STREQUAL "Ninja")
+        set({MSLK_MAX_JOBS_STRING_VALUE $ENV{{MSLK_MAX_JOBS})
+        math(EXPR {MSLK_MAX_JOBS_INTEGER_VALUE "${{MSLK_MAX_JOBS_STRING_VALUE}")
+        set_property(GLOBAL APPEND PROPERTY JOB_POOLS mslk_pool=${{MSLK_MAX_JOBS_INTEGER_VALUE})
+        set_property(TARGET mslk PROPERTY JOB_POOL_COMPILE mslk_pool)
+        set_property(TARGET mslk PROPERTY JOB_POOL_LINK mslk_pool)
+      else()
+        message(WARNING "{MSLK_MAX_JOBS was ignored. This option only works with the Ninja build system")
+      endif()
+    endif()
   elseif(USE_ROCM)
     # Path to vendored CK
     set(MSLK_CK_DIR "${MSLK_THIRD_PARTY}/composable_kernel")
