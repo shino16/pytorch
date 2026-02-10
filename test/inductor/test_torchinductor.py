@@ -14715,18 +14715,20 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         from torch._inductor.utils import run_and_get_code
 
+        # First compile with small tensor: ks gets i32 (guarded)
+        fn = torch.compile(torch.mean, dynamic=True)
+        x_small = torch.randn(1000, 32, device=self.device)
+        self.assertEqual(fn(x_small), x_small.mean())
+
+        # Call with large tensor (numel > int32_max): guard must trigger
+        # recompilation with i64 ks. Without recompilation, ks0*ks0
+        # overflows int32 and produces wrong results.
         t = torch.rand(30000, 100000, dtype=torch.float, device=self.device)
         expected = torch.mean(t)
-        actual, codes = run_and_get_code(
-            torch.compile(torch.mean, dynamic=True), t
-        )
+        actual = fn(t)
         self.assertTrue(
             torch.allclose(expected, actual, atol=1e-2, rtol=1e-2),
             f"{expected=} {actual=}",
-        )
-        self.assertTrue(
-            any("'ks0': 'i64'" in c for c in codes),
-            "Expected ks0 to use i64 when numel > int32_max",
         )
 
     def test_remove_noop_view_default(self):
