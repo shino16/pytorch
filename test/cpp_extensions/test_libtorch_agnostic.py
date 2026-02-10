@@ -1366,7 +1366,19 @@ except RuntimeError as e:
         )
 
         if show_cpp_stacktraces:
-            self.assertIn("C++ CapturedTraceback:", error_message)
+            # On x86 we get "C++ CapturedTraceback:"; on aarch64 it's disabled (Module.cpp)
+            # and we get the default c10 format ("Exception raised from" + "frame #").
+            has_cpp_trace = (
+                "C++ CapturedTraceback:" in error_message
+                or (
+                    "Exception raised from" in error_message
+                    and "frame #" in error_message
+                )
+            )
+            self.assertTrue(
+                has_cpp_trace,
+                f"Expected C++ stack trace in error message, got: {error_message}",
+            )
             self.assertRegex(
                 error_message,
                 r"Exception raised from test_std_.*_check_error at .*test_std_.*check\..*:\d+",
@@ -1535,7 +1547,19 @@ except RuntimeError as e:
         )
 
         if show_cpp_stacktraces:
-            self.assertIn("C++ CapturedTraceback:", error_message)
+            # On x86 we get "C++ CapturedTraceback:"; on aarch64 it's disabled (Module.cpp)
+            # and we get the default c10 format ("Exception raised from" + "frame #").
+            has_cpp_trace = (
+                "C++ CapturedTraceback:" in error_message
+                or (
+                    "Exception raised from" in error_message
+                    and "frame #" in error_message
+                )
+            )
+            self.assertTrue(
+                has_cpp_trace,
+                f"Expected C++ stack trace in error message, got: {error_message}",
+            )
             self.assertRegex(
                 error_message,
                 r"Exception raised from test_std_.*_kernel_launch_check_error at .*test_std_.*_check\..*:\d+",
