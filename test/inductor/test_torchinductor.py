@@ -14694,6 +14694,41 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             f"{expected=} {actual=}",
         )
 
+    @requires_gpu()
+    def test_ks_dtype_small_numel_dynamic(self):
+        from torch._inductor.utils import run_and_get_code
+
+        x = torch.randn(1000, 32, device=self.device)
+        expected = x.mean()
+        actual, (code,) = run_and_get_code(
+            torch.compile(torch.mean, dynamic=True), x
+        )
+        self.assertEqual(expected, actual)
+        self.assertIn("'ks0': 'i32'", code)
+
+    @skip_if_halide  # only 32-bit indexing
+    @requires_gpu()
+    @largeTensorTest("16GB", inductor=True)
+    def test_ks_dtype_large_numel_dynamic(self):
+        if self.device == "cpu":
+            raise unittest.SkipTest("skip for cpu")
+
+        from torch._inductor.utils import run_and_get_code
+
+        t = torch.rand(30000, 100000, dtype=torch.float, device=self.device)
+        expected = torch.mean(t)
+        actual, codes = run_and_get_code(
+            torch.compile(torch.mean, dynamic=True), t
+        )
+        self.assertTrue(
+            torch.allclose(expected, actual, atol=1e-2, rtol=1e-2),
+            f"{expected=} {actual=}",
+        )
+        self.assertTrue(
+            any("'ks0': 'i64'" in c for c in codes),
+            "Expected ks0 to use i64 when numel > int32_max",
+        )
+
     def test_remove_noop_view_default(self):
         def f(x):
             batch_size = x.shape[0]
