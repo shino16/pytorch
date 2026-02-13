@@ -34,7 +34,7 @@ class TestCodeCompatibleWithDevice(TestCase):
         self.assertFalse(
             torch.cuda._code_compatible_with_device(device_cc=53, code_cc=50)
         )
-        self.assertFalse(
+        self.assertTrue(
             torch.cuda._code_compatible_with_device(device_cc=87, code_cc=80)
         )
         self.assertTrue(
