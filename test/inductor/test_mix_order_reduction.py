@@ -727,6 +727,76 @@ class MixOrderReductionTest(TestBase):
         self.assertEqual(len(compile_metrics), 1, "Don't recompile")
 
 
+class RsplitConfigTest(TestBase):
+    def test_rsplit_num_stages_fallback_many_loads(self):
+        """
+        When num_load is high and rnumel is large, persistent_reduction must
+        include a NUM_STAGES=1 fallback config so that kernels don't exceed
+        the GPU's shared memory limit.
+        """
+        from torch._inductor.runtime.triton_heuristics import persistent_reduction
+
+        size_hints = {"x": 40960, "r0_": 4096}
+        inductor_meta = {
+            "RSPLIT_SIZE": 32,
+            "num_load": 7,
+            "num_store": 0,
+            "num_reduction": 1,
+        }
+        triton_meta = {"native_matmul": False}
+
+        configs = persistent_reduction(
+            size_hints,
+            reduction_hint=False,
+            triton_meta=triton_meta,
+            inductor_meta=inductor_meta,
+            return_configs=True,
+        )
+
+        num_stages_values = [c.kwargs.get("NUM_STAGES") for c in configs]
+        self.assertIn(1, num_stages_values)
+        # The primary heuristic should pick NUM_STAGES=1 directly
+        # since num_loads >= 5 and rnumel > 2048
+        self.assertTrue(
+            all(s == 1 for s in num_stages_values),
+            f"All configs should use NUM_STAGES=1 for 7 loads with rnumel=4096, "
+            f"got {num_stages_values}",
+        )
+
+    def test_rsplit_num_stages_fallback_moderate_loads(self):
+        """
+        With moderate num_loads and medium rnumel, configs should have both
+        higher NUM_STAGES and a NUM_STAGES=1 fallback.
+        """
+        from torch._inductor.runtime.triton_heuristics import persistent_reduction
+
+        size_hints = {"x": 40960, "r0_": 2048}
+        inductor_meta = {
+            "RSPLIT_SIZE": 32,
+            "num_load": 5,
+            "num_store": 0,
+            "num_reduction": 1,
+        }
+        triton_meta = {"native_matmul": False}
+
+        configs = persistent_reduction(
+            size_hints,
+            reduction_hint=False,
+            triton_meta=triton_meta,
+            inductor_meta=inductor_meta,
+            return_configs=True,
+        )
+
+        num_stages_values = [c.kwargs.get("NUM_STAGES") for c in configs]
+        self.assertIn(1, num_stages_values)
+        # Should also have higher-staged configs since rnumel=2048
+        # is not over the 2048 threshold for forcing stages=1
+        self.assertTrue(
+            any(s > 1 for s in num_stages_values),
+            f"Should include configs with NUM_STAGES > 1, got {num_stages_values}",
+        )
+
+
 @inductor_config.patch(
     "triton.mix_order_reduction", not inductor_config.triton.mix_order_reduction
 )
