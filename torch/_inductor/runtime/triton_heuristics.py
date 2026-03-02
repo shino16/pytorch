@@ -3798,18 +3798,23 @@ def persistent_reduction(
                 required_x_block, tma_min_block_sizes.get("XBLOCK", 1)
             )
         x_block = min(max(rsplit_size // 32, min_x_block, required_x_block), 16)
+        num_iters = rsplit_size // x_block
+        num_loads = inductor_meta.get("num_load", 0)
+        # With large rnumel, we have higher chance of out-of-shared memory.
+        # Also account for num_loads: each pipelined load holds
+        # next_power_of_2(rnumel) * dtype_size bytes of shared memory per stage.
+        MAX_NUM_STAGES = 2 if rnumel_hint > 8192 else 3
+        if num_loads >= 5 and rnumel_hint > 1024:
+            MAX_NUM_STAGES = min(MAX_NUM_STAGES, 2)
+        if num_loads >= 5 and rnumel_hint > 2048:
+            MAX_NUM_STAGES = 1
+        num_stages = min(max(num_iters // 4, 1), MAX_NUM_STAGES)
+
         for c in configs:
             c.kwargs["RSPLIT_SIZE"] = rsplit_size
             # small XBLOCK to use less registers/smem
             c.kwargs["XBLOCK"] = x_block
-
-            num_iters = rsplit_size // x_block
-
-            # With large rnumel, we have higher chance of out-of-shared memory
-            # To avoid adding too much autotuning overhead, we just constrain NUM_STAGES
-            # if rnumel is large
-            MAX_NUM_STAGES = 2 if rnumel_hint > 8192 else 3
-            c.kwargs["NUM_STAGES"] = min(max(num_iters // 4, 1), MAX_NUM_STAGES)
+            c.kwargs["NUM_STAGES"] = num_stages
 
             if rnumel_hint <= 1024:
                 c.num_warps //= 2
@@ -3831,6 +3836,14 @@ def persistent_reduction(
                     newc = copy.deepcopy(c)
                     newc.num_warps *= 2
                     new_configs.append(newc)
+
+            # Always include a NUM_STAGES=1 fallback to handle kernels
+            # where high pipelining depth exceeds shared memory limits.
+            if num_stages > 1:
+                fallback = copy.deepcopy(c)
+                fallback.kwargs["NUM_STAGES"] = 1
+                new_configs.append(fallback)
+
         configs = unique_configs(new_configs)
 
     configs = filter_reduction_configs_for_determinism(inductor_meta, configs)
