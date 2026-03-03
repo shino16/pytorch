@@ -4826,6 +4826,7 @@ if HAS_CUDA_AND_TRITON:
                         "def triton_poi_fused_add_", 1, exactly=True
                     ).run(code[0])
 
+        @unittest.skip("Disabled upstream: https://github.com/pytorch/pytorch/issues/176144")
         @unittest.skipUnless(
             config.graph_partition, "Test requires graph_partition to be enabled"
         )
