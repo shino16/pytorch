@@ -134,6 +134,8 @@ def _nvcc_arch_as_compile_option() -> str:
         return "101a"
     if arch == "103":
         return "103a"
+    if arch == "107":
+        return "107a"
     if arch == "110":
         return "110a"
     if arch == "120":
