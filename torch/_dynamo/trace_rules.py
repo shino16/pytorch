@@ -530,6 +530,8 @@ torch_c_binding_in_graph_functions = dict.fromkeys(
         "torch._C._cuda_get_sync_debug_mode",
         "torch._C._cuda_getAllocator",
         "torch._C._cuda_getAllocatorBackend",
+        "torch._C._cuda_getNativeAllocatorBackendName",
+        "torch._C._cuda_resetNativeAllocatorBackendToCaching",
         "torch._C._cuda_getArchFlags",
         "torch._C._cuda_getCheckpointState",
         "torch._C._cuda_getCompiledVersion",

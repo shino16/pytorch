@@ -23,6 +23,12 @@ from . import (
     is_initialized,
 )
 from ._memory_viz import memory as _memory, segments as _segments
+from .green_contexts import (
+    _LocalizedAllocator,
+    _LocalizedGreenContextMemPool,
+    GreenContext,
+    is_localization_supported,
+)
 
 
 if TYPE_CHECKING:
@@ -57,8 +63,15 @@ __all__ = [
     "list_gpu_processes",
     "mem_get_info",
     "get_allocator_backend",
+    "get_native_allocator_backend",
+    "LocalizedAllocator",
+    "NativeAllocatorBackendWrapper",
+    "CustomNativeAllocator",
+    "reset_native_allocator_backend_to_caching",
+    "use_native_allocator_backend",
     "CUDAPluggableAllocator",
     "change_current_allocator",
+    "LocalizedGreenContextMemPool",
     "MemPool",
     "use_mem_pool",
 ]
@@ -68,6 +81,15 @@ if not hasattr(torch._C, "_cuda_CUDAAllocator"):
     # Define dummy base classes
     torch._C.__dict__["_cuda_CUDAAllocator"] = _dummy_type("_cuda_CUDAAllocator")
 
+if not hasattr(torch._C, "_NativeAllocatorBackendBase"):
+    torch._C.__dict__["_NativeAllocatorBackendBase"] = _dummy_type(
+        "_NativeAllocatorBackendBase"
+    )
+
+if not hasattr(torch._C, "_NativeAllocatorBackend"):
+    torch._C.__dict__["_NativeAllocatorBackend"] = _dummy_type(
+        "_NativeAllocatorBackend"
+    )
 
 if not hasattr(torch._C, "_MemPool"):
     # Define dummy base classes
@@ -90,6 +112,8 @@ from torch._C import (  # noqa: F401
     _cuda_endAllocateToPool,
     _cuda_releasePool,
     _MemPool,
+    _NativeAllocatorBackend,
+    _NativeAllocatorBackendBase,  # pyrefly: ignore [missing-module-attribute]
 )
 
 
@@ -1185,6 +1209,161 @@ def get_allocator_backend() -> str:
     return torch._C._cuda_getAllocatorBackend()
 
 
+def get_native_allocator_backend() -> str:
+    r"""Return the name of the current native allocator backend when the active
+    allocator is the native one (see :func:`~torch.cuda.memory.get_allocator_backend`).
+
+    Returns one of ``"caching"``, ``"uncached"``, or ``"custom"``. Returns an empty
+    string if the current allocator is not the native one (e.g. when using
+    ``cudaMallocAsync`` or a pluggable allocator).
+
+    .. note::
+        See :ref:`cuda-memory-management` for details on the native allocator backend.
+    """
+    return torch._C._cuda_getNativeAllocatorBackendName()
+
+
+class NativeAllocatorBackendWrapper:
+    r"""Wrapper for a native CUDA allocator backend
+    (C++ :class:`torch._C._NativeAllocatorBackendBase`).
+
+    Holds a backend instance and forwards :func:`set_as_native_backend` and
+    :func:`reset_to_caching`. Pass this or a subclass to
+    :func:`use_native_allocator_backend`.
+    """
+
+    def __init__(self, backend: _NativeAllocatorBackendBase) -> None:
+        self._backend = backend
+
+    def set_as_native_backend(self) -> None:
+        self._backend.set_as_native_backend()
+
+    def reset_to_caching(self) -> None:
+        self._backend.reset_to_caching()
+
+
+class CustomNativeAllocator(NativeAllocatorBackendWrapper):
+    r"""Wrapper for a native CUDA allocator backend loaded from a .so file."""
+
+    def __init__(self, path_to_so: str, alloc_fn_name: str, free_fn_name: str):
+        self._backend = torch._C._NativeAllocatorBackend(
+            path_to_so, alloc_fn_name, free_fn_name
+        )
+
+    def set_as_native_backend(self) -> None:
+        r"""Make the native allocator use this backend for allocate/free."""
+        self._backend.set_as_native_backend()
+
+    def reset_to_caching(self) -> None:
+        r"""Reset the native allocator back to the built-in caching backend."""
+        self._backend.reset_to_caching()
+
+
+class LocalizedAllocator(NativeAllocatorBackendWrapper):
+    r"""Wrapper around the C++ localized allocator backend (e.g. for uGPU memory-node allocation).
+
+    Use with :func:`use_native_allocator_backend` to route CUDA allocations through the
+    localized allocator. Requires :func:`torch.cuda.green_contexts.is_localization_supported`
+    to return true for the current device.
+    """
+
+    def __init__(self) -> None:
+        device_id = torch.cuda.current_device()
+        if not is_localization_supported(device_id):
+            raise RuntimeError(
+                "Green Context localization must be supported on this device for a localized allocator!"
+            )
+        super().__init__(_LocalizedAllocator())
+
+    @staticmethod
+    def split(t: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        r"""Split the given tensor into a list of tensor views,
+          each of which is allocated on a different memory node.
+
+        Note: currently only supports two memory nodes.
+        Note: if a clean split into contiguous chunks along the dimensions
+        of `t` is not possible, then a list of flat views is returned.
+        """
+        if _LocalizedAllocator is object:
+            raise RuntimeError(
+                "Localized allocator split is not supported with this PyTorch build!"
+            )
+        align = _LocalizedAllocator.min_alignment  # pyrefly: ignore [missing-attribute]
+        if align % t.element_size() != 0:
+            raise ValueError(
+                f"Minimum alignment {align} is not "
+                f"a multiple of tensor element size {t.element_size()}. "
+                "This is not supported by the localized allocator."
+            )
+        if t.numel() <= 1:
+            # since the minimum alignment is a multiple of element size,
+            # the second half must always be empty
+            return (t, torch.empty(0, device=t.device, dtype=t.dtype))
+
+        def round_up(x, y):
+            return ((x + y - 1) // y) * y
+
+        tf = t.view(-1)
+        num_bytes = tf.numel() * tf.element_size()
+        split_byte = round_up(num_bytes // 2, align)
+        split_idx = split_byte // tf.element_size()
+        flat_split = torch.tensor_split(tf, (split_idx,))
+
+        for i in range(t.ndim):
+            # note: we cannot skip all dimensions here,
+            # because we have at least 2 elements in the tensor.
+            if t.shape[i] == 1:
+                continue
+            trailing_elems = t[(0,) * (i + 1)].numel()
+            if split_idx % trailing_elems != 0:
+                # if this is not the case, we cannot cleanly split
+                break
+            leading_dims = [1 for _ in range(i)]
+            trailing_dims = list(t.shape[i + 1 :])
+            return tuple(
+                x.view(*(leading_dims + [-1] + trailing_dims)) for x in flat_split
+            )
+
+        # cannot split cleanly into contiguous chunks: return flat views
+        return flat_split
+
+
+def reset_native_allocator_backend_to_caching() -> None:
+    r"""Reset the native allocator's backend to the built-in caching implementation.
+
+    Only has effect when the current allocator is the native one. No-op when
+    ``PYTORCH_NO_CUDA_MEMORY_CACHING`` is set or when the current allocator is not native.
+    """
+    torch._C._cuda_resetNativeAllocatorBackendToCaching()
+
+
+@contextlib.contextmanager
+def use_native_allocator_backend(backend: NativeAllocatorBackendWrapper):
+    r"""Context manager that temporarily uses the given native allocator backend.
+
+    On entry, calls ``backend.set_as_native_backend()``. On exit, calls
+    ``backend.reset_to_caching()`` so the built-in caching backend is restored.
+
+    Args:
+        backend: A NativeAllocatorBackendWrapper instance,
+        e.g. :class:`CustomNativeAllocator` or :class:`LocalizedAllocator`.
+
+    Example:
+        >>> backend = torch.cuda.memory.CustomNativeAllocator(
+        ...     "/path/to/libmyalloc.so", "my_alloc", "my_free"
+        ... )
+        >>> with torch.cuda.memory.use_native_allocator_backend(backend):
+        ...     # allocations use the custom backend
+        ...     x = torch.zeros(10, device="cuda")
+        >>> # back to built-in caching
+    """
+    backend.set_as_native_backend()
+    try:
+        yield
+    finally:
+        backend.reset_to_caching()
+
+
 class _CUDAAllocator:
     r"""Wrapper over internal CUDA memory allocators."""
 
@@ -1307,6 +1486,79 @@ class MemPool(_MemPool):
         return snapshot
 
 
+# pyrefly: ignore [invalid-inheritance]
+class LocalizedGreenContextMemPool(_LocalizedGreenContextMemPool, MemPool):
+    r"""MemPool that routes allocations based on a localized GreenContext.
+
+    Instances are created only via :meth:`create_node_pools`, which takes a list
+    of :class:`GreenContext` (e.g. from :meth:`GreenContext.create_localized`).
+    Each pool in the returned list corresponds to one entry in that list. The
+    :attr:`green_context` property gives access to the underlying green context.
+    """
+
+    @staticmethod
+    def create_node_pools(
+        green_contexts: list[GreenContext],
+        alloc_in_order: bool = False,
+    ) -> list["LocalizedGreenContextMemPool"]:
+        r"""Create a list of localized green context mem pools from a list of green contexts.
+
+        Arguments:
+            green_contexts (list[GreenContext]): List of green contexts, e.g. from
+                :meth:`GreenContext.create_localized`. Must include one context with
+                ``memory_node_id == 0``. The caller must keep this list alive for the
+                lifetime of the returned pools.
+            alloc_in_order (bool, optional): Assert that
+                :func:`use_mem_pool` will be entered in ascending
+                ``memory_node_id`` order, enabling lighter synchronization.
+                Can be changed later via the :attr:`alloc_in_order` property.
+                Default is ``False``.
+
+        Returns:
+            List of :class:`LocalizedGreenContextMemPool` objects, one per green context.
+        """
+        if not hasattr(torch._C, "_CUDALocalizedGreenContextMemPool"):
+            raise RuntimeError("PyTorch was not built with Green Context support!")
+        if any(not is_localization_supported(g.device_id) for g in green_contexts):
+            raise RuntimeError(
+                "Green Context localization is not supported on this device!"
+            )
+        return _LocalizedGreenContextMemPool.create_node_pools(  # type: ignore[attr-defined]
+            green_contexts,
+            alloc_in_order,
+        )
+
+    @property
+    def green_context(self) -> GreenContext:
+        r"""Return the :class:`GreenContext` that this pool routes allocations through."""
+        return super().green_context
+
+    @property
+    def alloc_in_order(self) -> bool:
+        r"""Whether the caller guarantees allocations are issued in memory-node order.
+
+        When ``True``, the pool uses lighter synchronization (a single event
+        broadcast from node 0 instead of per-pool stream blocking).  The caller
+        **must** ensure that :func:`use_mem_pool` is entered for each pool in
+        ascending ``memory_node_id`` order; violating this leads to undefined
+        behaviour.
+
+        Defaults to ``False``.
+        """
+        return super().alloc_in_order
+
+    @alloc_in_order.setter
+    def alloc_in_order(self, value: bool) -> None:
+        r"""Set whether allocations are issued in memory-node order.
+
+        See :attr:`alloc_in_order` for details.
+
+        Arguments:
+            value (bool): ``True`` to enable in-order mode, ``False`` to disable.
+        """
+        super().alloc_in_order = value  # pyrefly: ignore [read-only]
+
+
 @contextlib.contextmanager
 def use_mem_pool(pool: MemPool, device: "Device" = None):
     r"""A context manager that routes allocations to a given pool.
@@ -1327,9 +1579,11 @@ def use_mem_pool(pool: MemPool, device: "Device" = None):
     device_index = (
         torch.cuda.current_device() if device is None else _get_device_index(device)
     )
+    pool.call_on_begin_allocate(device_index)  # pyrefly: ignore [missing-attribute]
     _cuda_beginAllocateCurrentThreadToPool(device_index, pool.id)
     try:
         yield
     finally:
         _cuda_endAllocateToPool(device_index, pool.id)
+        pool.call_on_end_allocate(device_index)  # pyrefly: ignore [missing-attribute]
         _cuda_releasePool(device_index, pool.id)

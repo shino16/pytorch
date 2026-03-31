@@ -1934,6 +1934,7 @@ __all__ = [
     "Stream",
     "StreamContext",
     "GreenContext",
+    "LocalizedGreenContextMemPool",
     "amp",
     "caching_allocator_alloc",
     "caching_allocator_delete",
