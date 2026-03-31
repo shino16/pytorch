@@ -39,6 +39,7 @@
 #include <set>
 #include <stack>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -4031,13 +4032,61 @@ static void uncached_delete(void* ptr) {
 }
 
 static void local_raw_delete(void* ptr);
+
+// Built-in backends for NativeCachingAllocator.
+class NativeCachingAllocator;
+
+struct UncachedNativeBackend final : NativeAllocatorBackend {
+  void* allocate(
+      size_t size,
+      c10::DeviceIndex /*device*/,
+      cudaStream_t /*stream*/) override {
+    return uncached_allocate(size);
+  }
+  void free(void* ptr) override {
+    uncached_delete(ptr);
+  }
+  DeleterFnPtr get_deleter() const override {
+    return &uncached_delete;
+  }
+  std::string name() const override {
+    return "uncached";
+  }
+};
+
+static UncachedNativeBackend uncached_backend;
+
+struct CachingNativeBackend final : NativeAllocatorBackend {
+  explicit CachingNativeBackend(NativeCachingAllocator* allocator)
+      : allocator_(allocator) {}
+  void* allocate(size_t size, c10::DeviceIndex device, cudaStream_t stream)
+      override;
+  void free(void* ptr) override;
+  DeleterFnPtr get_deleter() const override {
+    return &local_raw_delete;
+  }
+  std::string name() const override {
+    return "caching";
+  }
+
+ private:
+  NativeCachingAllocator* allocator_;
+};
+
 thread_local std::stack<std::string> DeviceCachingAllocator::compile_context;
 thread_local std::string DeviceCachingAllocator::user_metadata;
 
 class NativeCachingAllocator : public CUDAAllocator {
+  friend struct CachingNativeBackend;
+
  private:
   // allows this allocator to be turned on and off programmatically
   bool enable_ = true;
+
+  // Caching path backend; uncached path uses static uncached_backend.
+  CachingNativeBackend caching_backend_;
+  // optional custom backend (non-owning)
+  NativeAllocatorBackend* custom_backend_ = nullptr;
 
   // Shard allocation region to have independent mutexes to reduce contention.
   static constexpr size_t kNumMutexShard = 67;
@@ -4069,6 +4118,43 @@ class NativeCachingAllocator : public CUDAAllocator {
   RingBuffer<AnnotationEntry> annotation_buffer;
 
  public:
+  NativeCachingAllocator() : caching_backend_(this) {}
+
+  inline NativeAllocatorBackend const& get_backend() const {
+    if (C10_UNLIKELY(forceUncachedAllocator() || !isEnabled())) {
+      return uncached_backend;
+    } else if (C10_UNLIKELY(custom_backend_)) {
+      return *custom_backend_;
+    } else {
+      return caching_backend_;
+    }
+  }
+
+  inline NativeAllocatorBackend& get_backend() {
+    if (C10_UNLIKELY(forceUncachedAllocator() || !isEnabled())) {
+      return uncached_backend;
+    } else if (C10_UNLIKELY(custom_backend_)) {
+      return *custom_backend_;
+    } else {
+      return caching_backend_;
+    }
+  }
+
+  inline NativeAllocatorBackend const* get_custom_backend() const {
+    return custom_backend_;
+  }
+
+  inline NativeAllocatorBackend* get_custom_backend() {
+    return custom_backend_;
+  }
+
+  inline void set_custom_backend(NativeAllocatorBackend* backend) {
+    if (C10_UNLIKELY(forceUncachedAllocator() || !isEnabled())) {
+      return;
+    }
+    custom_backend_ = backend;
+  }
+
   std::vector<std::unique_ptr<DeviceCachingAllocator>> device_allocator;
 
   Block* get_allocated_block(void* ptr, bool remove = false) {
@@ -4106,35 +4192,11 @@ class NativeCachingAllocator : public CUDAAllocator {
       c10::DeviceIndex device,
       size_t size,
       cudaStream_t stream) {
-    TORCH_INTERNAL_ASSERT(
-        0 <= device && static_cast<size_t>(device) < device_allocator.size(),
-        "Allocator not initialized for device ",
-        device,
-        ": did you call init?");
-    Block* block = device_allocator[device]->malloc(size, stream);
-    add_allocated_block(block);
-    *devPtr = block->ptr;
-    const c10::impl::PyInterpreter* interp = c10::impl::GPUTrace::get_trace();
-    if (C10_UNLIKELY(interp)) {
-      (*interp)->trace_gpu_memory_allocation(
-          c10::kCUDA, reinterpret_cast<uintptr_t>(*devPtr));
-    }
+    *devPtr = caching_backend_.allocate(size, device, stream);
   }
 
   void free(void* ptr) {
-    if (!ptr) {
-      return;
-    }
-    Block* block = get_allocated_block(ptr, true /* remove */);
-    if (!block) {
-      TORCH_CHECK(false, "invalid device pointer: ", ptr);
-    }
-    const c10::impl::PyInterpreter* interp = c10::impl::GPUTrace::get_trace();
-    if (C10_UNLIKELY(interp)) {
-      (*interp)->trace_gpu_memory_deallocation(
-          c10::kCUDA, reinterpret_cast<uintptr_t>(block->ptr));
-    }
-    device_allocator[block->device]->free(block);
+    caching_backend_.free(ptr);
   }
 
   double getMemoryFraction(c10::DeviceIndex device) override {
@@ -4423,18 +4485,12 @@ class NativeCachingAllocator : public CUDAAllocator {
         "CUDA out of memory. Tried to allocate more than 1EB memory.");
     c10::DeviceIndex device = 0;
     C10_CUDA_CHECK(c10::cuda::GetDevice(&device));
-    void* devPtr = nullptr;
-    void (*deleteFunc)(void*) = &local_raw_delete;
     CUDAStream stream = cuda::getCurrentCUDAStream(device);
 
-    if (forceUncachedAllocator() || !isEnabled()) {
-      deleteFunc = &uncached_delete;
-      devPtr = uncached_allocate(size);
-    } else {
-      if (size != 0) {
-        this->malloc(&devPtr, device, size, stream);
-      }
-    }
+    NativeAllocatorBackend& backend = get_backend();
+    void* devPtr =
+        (size == 0) ? nullptr : backend.allocate(size, device, stream.stream());
+    DeleterFnPtr deleteFunc = backend.get_deleter();
 
     if (size && TORCH_SDT_IS_ENABLED(malloc)) {
       TORCH_SDT_WITH_SEMAPHORE(malloc, devPtr, device, size, stream.id());
@@ -4443,11 +4499,7 @@ class NativeCachingAllocator : public CUDAAllocator {
     return {devPtr, devPtr, deleteFunc, Device(DeviceType::CUDA, device)};
   }
   DeleterFnPtr raw_deleter() const override {
-    if (forceUncachedAllocator() || !isEnabled()) {
-      return &uncached_delete;
-    } else {
-      return &local_raw_delete;
-    }
+    return get_backend().get_deleter();
   }
   void cacheInfo(c10::DeviceIndex device, size_t* largestBlock) override {
     device_allocator[device]->cacheInfo(largestBlock);
@@ -4529,30 +4581,19 @@ class NativeCachingAllocator : public CUDAAllocator {
     if (nbytes == 0) {
       return nullptr;
     }
-    void* r = nullptr;
-    if (forceUncachedAllocator() || !isEnabled()) {
-      r = uncached_allocate(nbytes);
-    } else {
-      c10::DeviceIndex device = 0;
-      C10_CUDA_CHECK(c10::cuda::GetDevice(&device));
-      malloc(&r, device, nbytes, cuda::getCurrentCUDAStream(device));
-    }
-    return r;
+    c10::DeviceIndex device = 0;
+    C10_CUDA_CHECK(c10::cuda::GetDevice(&device));
+    return get_backend().allocate(
+        nbytes, device, cuda::getCurrentCUDAStream(device));
   }
 
   void* raw_alloc_with_stream(size_t nbytes, cudaStream_t stream) override {
     if (nbytes == 0) {
       return nullptr;
     }
-    void* r = nullptr;
-    if (forceUncachedAllocator() || !isEnabled()) {
-      r = uncached_allocate(nbytes);
-    } else {
-      c10::DeviceIndex device = 0;
-      C10_CUDA_CHECK(c10::cuda::GetDevice(&device));
-      malloc(&r, device, nbytes, stream);
-    }
-    return r;
+    c10::DeviceIndex device = 0;
+    C10_CUDA_CHECK(c10::cuda::GetDevice(&device));
+    return get_backend().allocate(nbytes, device, stream);
   }
 
   void enablePeerAccess(c10::DeviceIndex dev, c10::DeviceIndex dev_to_access)
@@ -4596,11 +4637,7 @@ class NativeCachingAllocator : public CUDAAllocator {
   }
 
   void raw_delete(void* ptr) override {
-    if (forceUncachedAllocator() || !isEnabled()) {
-      uncached_delete(ptr);
-    } else {
-      this->free(ptr);
-    }
+    get_backend().free(ptr);
   }
 
   // In CUDA IPC, sender sends a tensor to receiver via shareIPCHandle,
@@ -4731,6 +4768,43 @@ class NativeCachingAllocator : public CUDAAllocator {
   }
 };
 
+void* CachingNativeBackend::allocate(
+    size_t size,
+    c10::DeviceIndex device,
+    cudaStream_t stream) {
+  TORCH_INTERNAL_ASSERT(
+      0 <= device &&
+          static_cast<size_t>(device) < allocator_->device_allocator.size(),
+      "Allocator not initialized for device ",
+      device,
+      ": did you call init?");
+  Block* block = allocator_->device_allocator[device]->malloc(size, stream);
+  allocator_->add_allocated_block(block);
+  void* devPtr = block->ptr;
+  const c10::impl::PyInterpreter* interp = c10::impl::GPUTrace::get_trace();
+  if (C10_UNLIKELY(interp)) {
+    (*interp)->trace_gpu_memory_allocation(
+        c10::kCUDA, reinterpret_cast<uintptr_t>(devPtr));
+  }
+  return devPtr;
+}
+
+void CachingNativeBackend::free(void* ptr) {
+  if (!ptr) {
+    return;
+  }
+  Block* block = allocator_->get_allocated_block(ptr, true /* remove */);
+  if (!block) {
+    TORCH_CHECK(false, "invalid device pointer: ", ptr);
+  }
+  const c10::impl::PyInterpreter* interp = c10::impl::GPUTrace::get_trace();
+  if (C10_UNLIKELY(interp)) {
+    (*interp)->trace_gpu_memory_deallocation(
+        c10::kCUDA, reinterpret_cast<uintptr_t>(block->ptr));
+  }
+  allocator_->device_allocator[block->device]->free(block);
+}
+
 static NativeCachingAllocator allocator;
 
 void local_raw_delete(void* ptr) {
@@ -4742,6 +4816,33 @@ void local_raw_delete(void* ptr) {
 }
 
 } // namespace Native
+
+std::string getNativeAllocatorBackendName() {
+  Native::NativeCachingAllocator* native =
+      dynamic_cast<Native::NativeCachingAllocator*>(allocator.load());
+  if (!native) {
+    return "";
+  }
+  return native->get_backend().name();
+}
+
+void setNativeAllocatorBackend(NativeAllocatorBackend* backend) {
+  Native::NativeCachingAllocator* native =
+      dynamic_cast<Native::NativeCachingAllocator*>(allocator.load());
+  if (!native) {
+    return;
+  }
+  native->set_custom_backend(backend);
+}
+
+void resetNativeAllocatorBackendToCaching() {
+  Native::NativeCachingAllocator* native =
+      dynamic_cast<Native::NativeCachingAllocator*>(allocator.load());
+  if (!native) {
+    return;
+  }
+  native->set_custom_backend(nullptr);
+}
 
 namespace CudaMallocAsync {
 // If this is put in its own header file, it gets incorrectly renamed in HIPify.
