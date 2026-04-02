@@ -2891,6 +2891,11 @@ def get_default_op_list() -> OpTypes:
     ]  # noqa: E501,B950
     # Natalia said that we should allow recomputing indexing :)
     default_recomputable_ops += [aten.index, aten.gather]
+    # INT8 matmul is cheap on modern GPUs (tensor core INT8 throughput is 2-4x
+    # float) and commonly appears in quantized models with LoRA. Allowing
+    # recomputation prevents the partitioner from saving large dequantization
+    # intermediates (see https://github.com/pytorch/pytorch/issues/175058).
+    default_recomputable_ops += [aten._int_mm]
     default_recomputable_ops += view_ops
 
     default_recomputable_ops += pointwise_ops()

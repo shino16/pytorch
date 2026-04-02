@@ -7079,6 +7079,102 @@ def forward(self, primals_1, tangents_1):
             [0, 1, 2],
         )
 
+    @unittest.skipIf(not USE_NETWORKX, "networkx not available")
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
+    def test_int_mm_recomputable_in_partitioner(self):
+        """aten._int_mm should be recomputable so the min-cut partitioner can
+        avoid saving large dequantization intermediates in quantized models.
+        See https://github.com/pytorch/pytorch/issues/175058
+
+        CUDA-only because the motivating regression is GPU memory; _int_mm
+        has a CPU dispatch but INT8 quantized training targets GPUs.
+
+        NOTE: other INT8/INT4 matmul ops (_weight_int8pack_mm,
+        _weight_int4pack_mm) have different decomposition patterns and are
+        not addressed here.
+        """
+
+        def fn(x, w_int8, w_scale, lora_A, lora_B):
+            x_2d = x.reshape(-1, x.shape[-1])
+            x_abs_max = x_2d.abs().amax(dim=1, keepdim=True).clamp(min=1e-12)
+            x_scale = 127.0 / x_abs_max
+            x_int8 = (x_2d * x_scale).round().clamp(-128, 127).to(torch.int8)
+            out_i32 = torch._int_mm(x_int8, w_int8.t())
+            out = (out_i32.float() / x_scale) * w_scale.t()
+            out = out.to(x.dtype)
+            lora_out = (x_2d @ lora_A) @ lora_B
+            return (out + lora_out).reshape(x.shape[:-1] + (w_int8.shape[0],))
+
+        D_in, D_out, S, R = 64, 128, 32, 4
+        x = torch.randn(
+            1, S, D_in, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        w_int8 = torch.randint(
+            -128, 128, (D_out, D_in), device="cuda", dtype=torch.int8
+        )
+        w_scale = torch.randn(D_out, 1, device="cuda", dtype=torch.float32).abs()
+        lora_A = torch.randn(
+            D_in, R, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        lora_B = torch.randn(
+            R, D_out, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+
+        fw_graph, bw_graph = get_fw_bw_graph(fn, [x, w_int8, w_scale, lora_A, lora_B])
+
+        # The dequantization intermediate has shape (S, D_out) in float32 -
+        # the output of _int_mm after int32->float conversion and scale
+        # division.  The LoRA path also produces (S, D_out) but in bfloat16,
+        # so we filter on float32 to target the dequant path specifically.
+        dequant_shape = (S, D_out)
+        for node in fw_graph.graph.nodes:
+            if node.op == "output":
+                fw_outs = node.args[0]
+                break
+        saved = fw_outs[1:]
+        self.assertGreater(len(saved), 0, "expected saved activations")
+        for out_node in saved:
+            if hasattr(out_node, "meta") and "val" in out_node.meta:
+                val = out_node.meta["val"]
+                if (
+                    isinstance(val, torch.Tensor)
+                    and val.dtype == torch.float32
+                    and tuple(val.shape) == dequant_shape
+                ):
+                    self.fail(
+                        f"Partitioner saved float32 dequantization intermediate "
+                        f"{out_node.name} (shape={tuple(val.shape)}). "
+                        f"_int_mm should be recomputable to avoid this."
+                    )
+
+        # Verify numerical correctness: recomputation during backward must
+        # produce the same gradients as eager execution.
+        x2 = x.detach().clone().requires_grad_(True)
+        lora_A2 = lora_A.detach().clone().requires_grad_(True)
+        lora_B2 = lora_B.detach().clone().requires_grad_(True)
+
+        ref = fn(x2, w_int8, w_scale, lora_A2, lora_B2)
+        ref.sum().backward()
+
+        compiled_fn = aot_function(
+            fn,
+            fw_compiler=nop,
+            bw_compiler=nop,
+            partition_fn=min_cut_rematerialization_partition,
+            decompositions=default_decompositions,
+        )
+        x3 = x.detach().clone().requires_grad_(True)
+        lora_A3 = lora_A.detach().clone().requires_grad_(True)
+        lora_B3 = lora_B.detach().clone().requires_grad_(True)
+
+        out = compiled_fn(x3, w_int8, w_scale, lora_A3, lora_B3)
+        out.sum().backward()
+
+        torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(x3.grad, x2.grad, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(lora_A3.grad, lora_A2.grad, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(lora_B3.grad, lora_B2.grad, rtol=1e-2, atol=1e-2)
+
 
 class TestAOTDispatch(AOTTestCase):
     # Tests to add cases for (non-exhaustive list, mostly for my notes):
