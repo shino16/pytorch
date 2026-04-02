@@ -5,8 +5,79 @@
 #include <ATen/ExpandUtils.h>
 #include <ATen/WrapDimUtilsMulti.h>
 
+#include <unordered_set>
 #include <utility>
+
 namespace at::functionalization {
+
+// Detect whether as_strided with the given sizes/strides creates
+// a view where distinct logical indices map to the same storage offset
+// (internal overlap).  Returns true only when overlap is certain.
+// For very large views (numel > 1M) where precise enumeration is too
+// expensive, returns false (permissive) to avoid false positives.
+static bool as_strided_has_internal_overlap(
+    at::SymIntArrayRef sizes,
+    at::SymIntArrayRef strides) {
+  auto ndim = static_cast<int64_t>(sizes.size());
+  if (ndim == 0) return false;
+
+  std::vector<int64_t> csizes(ndim), cstrides(ndim);
+  int64_t numel = 1;
+  for (int64_t i = 0; i < ndim; i++) {
+    auto s = sizes[i].maybe_as_int();
+    auto st = strides[i].maybe_as_int();
+    if (!s.has_value() || !st.has_value()) {
+      return false;  // symbolic dims -- cannot check statically
+    }
+    csizes[i] = *s;
+    cstrides[i] = *st;
+    if (csizes[i] == 0) return false;
+    numel *= csizes[i];
+  }
+  if (numel <= 1) return false;
+
+  // Zero stride with size > 1 is the expand() pattern -- definite overlap.
+  for (int64_t i = 0; i < ndim; i++) {
+    if (cstrides[i] == 0 && csizes[i] > 1) return true;
+  }
+
+  // Pigeonhole: more logical elements than distinct storage offsets.
+  int64_t lo = 0, hi = 0;
+  for (int64_t i = 0; i < ndim; i++) {
+    int64_t span = (csizes[i] - 1) * cstrides[i];
+    if (span >= 0) { hi += span; } else { lo += span; }
+  }
+  if (numel > hi - lo + 1) return true;
+
+  // Precise enumeration for moderate-sized views.
+  constexpr int64_t kMaxEnumerate = 1000000;
+  if (numel <= kMaxEnumerate) {
+    std::unordered_set<int64_t> offsets;
+    offsets.reserve(static_cast<size_t>(numel));
+    std::vector<int64_t> idx(ndim, 0);
+    for (int64_t n = 0; n < numel; n++) {
+      int64_t offset = 0;
+      for (int64_t d = 0; d < ndim; d++) {
+        offset += idx[d] * cstrides[d];
+      }
+      if (!offsets.insert(offset).second) return true;
+      for (int64_t d = ndim - 1; d >= 0; d--) {
+        if (++idx[d] < csizes[d]) break;
+        idx[d] = 0;
+      }
+    }
+    return false;
+  }
+
+  // For very large tensors (numel > kMaxEnumerate) where pigeonhole didn't
+  // fire, be permissive: return false rather than risk a false positive.
+  // The sorted-stride heuristic has false positives for coprime strides
+  // (e.g. strides (2, 2001) on shape (1001, 1001) -- no collision, but the
+  // heuristic flags it).  Exotic large-tensor overlaps that escape the
+  // pigeonhole + zero-stride checks were already silently wrong before this
+  // guard, so not catching them is no regression.
+  return false;
+}
 
 // This logic is similar to autograd code for view backwards calls.
 // We can't easily share it though, because (eventually) these functions
@@ -150,6 +221,17 @@ Tensor FunctionalInverses::as_strided_inverse(const Tensor& base, const Tensor& 
       return mutated_view.as_strided_symint(
           base.sym_sizes(), base.sym_strides(), base.sym_storage_offset());
     } else {
+      TORCH_CHECK(
+        !(inverse_return_mode == InverseReturnMode::ViewOrScatterInverse &&
+          as_strided_has_internal_overlap(size, stride)),
+        "While executing as_strided, functionalization encountered a tensor "
+        "being mutated that has internal overlap. "
+        "When using torch.compile (or running functionalization directly), "
+        "this is banned as the behavior is not well defined. "
+        "Consider cloning the tensor before mutating it, "
+        "or removing the mutation from your model. "
+        "as_strided(size=", size, ", stride=", stride, ")"
+      );
       return base.as_strided_scatter_symint(mutated_view, size, stride, std::move(storage_offset));
     }
 }

@@ -608,6 +608,58 @@ def forward(self, arg0_1):
     """,
         )
 
+    def test_as_strided_overlapping_mutation_error(self):
+        # Overlapping strides: stride (1,1) on shape (2,2) means indices
+        # [0,1] and [1,0] map to the same storage offset.  Functionalization
+        # cannot faithfully replicate the eager semantics of in-place mutation
+        # on such a view (the shared location should get +N where N is the
+        # overlap multiplicity, but as_strided_scatter only does +1).
+        # See https://github.com/pytorch/pytorch/issues/174371
+        def f(a):
+            x = a.clone()
+            y = x.as_strided((2, 2), (1, 1), 0)
+            y.add_(1.0)
+            return y
+
+        with self.assertRaisesRegex(RuntimeError, "has internal overlap"):
+            torch.compile(f, backend="aot_eager")(torch.randn(2, 2, 10))
+
+    def test_as_strided_overlapping_expand_like_error(self):
+        # Zero stride with size > 1 is the expand() overlap pattern.
+        def f(x):
+            y = x.as_strided((3, 4), (0, 1), 0)
+            y.add_(1.0)
+            return y
+
+        with self.assertRaisesRegex(RuntimeError, "has internal overlap"):
+            torch.compile(f, backend="aot_eager")(torch.randn(4))
+
+    def test_as_strided_non_overlapping_mutation_ok(self):
+        # Strided view with gaps but NO overlap should still work.
+        def f(x):
+            y = x.as_strided((2,), (3,), 0)  # elements at offsets 0 and 3
+            y.add_(1.0)
+            return x
+
+        self.assert_functionalization(f, torch.ones(6))
+
+    def test_as_strided_overlapping_read_only_ok(self):
+        # Overlapping view that is only READ (no mutation) should not error.
+        def f(x):
+            y = x.as_strided((2, 2), (1, 1), 0)
+            return y + 1.0
+
+        self.assert_functionalization(f, torch.ones(4))
+
+    def test_as_strided_zero_element_ok(self):
+        # Zero-element view cannot overlap.
+        def f(x):
+            y = x.as_strided((0, 3), (1, 1), 0)
+            y.add_(1.0)
+            return y
+
+        self.assert_functionalization(f, torch.ones(4))
+
     def test_tensor_list_composite(self):
         def f(x):
             # Test an op with TensorList input
@@ -2304,6 +2356,8 @@ def forward(self, arg0_1):
 @xfail_inherited_tests(
     [
         "test_as_strided",
+        "test_as_strided_non_overlapping_mutation_ok",
+        "test_as_strided_overlapping_read_only_ok",
         "test_copy_",
         "test_diagonal",
         "test_diagonal_mutated_input",
