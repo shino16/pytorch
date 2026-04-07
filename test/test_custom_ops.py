@@ -4629,6 +4629,31 @@ class TestCustomOpFastPath(TestCase):
         y.sum().backward()
         self.assertEqual(x.grad, 2 * x)
 
+    def test_fast_path_autograd_skipped_under_no_grad(self):
+        @torch.library.custom_op(
+            "_torch_testing::fp_nograd_check", mutates_args=()
+        )
+        def fp_nograd_check(x: Tensor) -> Tensor:
+            return x**2
+
+        @fp_nograd_check.register_fake
+        def _(x):
+            return torch.empty_like(x)
+
+        def _setup_context(ctx, inputs, output):
+            raise AssertionError("setup_context must not be called under no_grad")
+
+        def _backward(ctx, grad):
+            raise AssertionError("backward must not be called")
+
+        fp_nograd_check.register_autograd(_backward, setup_context=_setup_context)
+
+        x = torch.randn(3, requires_grad=True)
+        with torch.no_grad():
+            with self._assert_fast_path_taken(fp_nograd_check):
+                result = fp_nograd_check(x)
+        self.assertEqual(result, x**2)
+
     def test_fast_path_inference_mode(self):
         @torch.library.custom_op("_torch_testing::fp_im", mutates_args=())
         def fp_im(x: Tensor) -> Tensor:
