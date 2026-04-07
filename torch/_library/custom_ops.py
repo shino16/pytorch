@@ -20,6 +20,8 @@ from .effects import EffectType
 device_types_t = str | Sequence[str] | None
 log = logging.getLogger(__name__)
 
+_FAST_PATH_FALLBACK = object()
+
 
 @overload
 def custom_op(
@@ -717,7 +719,7 @@ class CustomOpDef:
         - The TLS dispatch include set is a subset of the normal eager set
           (covers ``inference_mode``; excludes Functionalize, Vmap, etc.).
         - The schema has no tensor-list args and is not a view op.
-        When any condition fails, ``fast_call`` returns ``NotImplemented``
+        When any condition fails, ``fast_call`` returns ``_FAST_PATH_FALLBACK``
         and the call falls through to the C++ dispatcher."""
         schema = self._opoverload._schema
 
@@ -789,24 +791,24 @@ class CustomOpDef:
         def fast_call(*args, **kwargs):
             # Dynamo needs the fake impl and dispatcher.
             if torch.compiler.is_compiling():
-                return NotImplemented
+                return _FAST_PATH_FALLBACK
             if not args or kwargs:
-                return NotImplemented
+                return _FAST_PATH_FALLBACK
 
             # Single C++ call that checks: TorchFunctionMode, TLS dispatch
             # keys (autocast, functorch, etc. via one-dispatch-key-computation),
             # tensor subclasses, mixed devices, and requires_grad.
             check = _C._custom_op_fast_path_check(args, check_multi_device)
             if check is None:
-                return NotImplemented
+                return _FAST_PATH_FALLBACK
 
             device_type, any_requires_grad = check
 
             if device_type == "meta" or device_type in disabled_kernel:
-                return NotImplemented
+                return _FAST_PATH_FALLBACK
             fn = raw_fns.get(device_type) or raw_fns.get(None)
             if fn is None:
-                return NotImplemented
+                return _FAST_PATH_FALLBACK
 
             if is_mutable:
                 for idx in mutated_idxs:
@@ -832,7 +834,7 @@ class CustomOpDef:
 
         def fast_op(*args, **kwargs):
             result = fast_call(*args, **kwargs)
-            if result is not NotImplemented:
+            if result is not _FAST_PATH_FALLBACK:
                 return result
             return packet._orig_op(
                 *args, **kwargs
@@ -863,7 +865,7 @@ class CustomOpDef:
     def __call__(self, *args, **kwargs):
         if self._fast_call is not None:
             result = self._fast_call(*args, **kwargs)
-            if result is not NotImplemented:
+            if result is not _FAST_PATH_FALLBACK:
                 return result
         return self._opoverload(*args, **kwargs)
 
