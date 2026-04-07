@@ -1184,8 +1184,8 @@ static PyObject* custom_op_fast_path_check(PyObject* _unused, PyObject* args) {
   }
 
   // One-dispatch-key-computation: detect TLS deviation from normal eager.
-  // Normal eager: included ⊆ {BackendSelect, ADInplaceOrView},
-  //               excluded ⊇ {all autocast keys}.
+  // Normal eager: included <= {BackendSelect, ADInplaceOrView},
+  //               excluded >= {all autocast keys}.
   // Use raw bitwise ops to avoid DispatchKeySet::operator- which treats
   // backend bits specially.
   auto tls = c10::impl::tls_local_dispatch_key_set();
