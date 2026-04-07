@@ -4848,6 +4848,29 @@ class TestCustomOpFastPath(TestCase):
         self.assertEqual(fp_kw(x, y=y), x + y)
         self.assertEqual(torch.ops._torch_testing.fp_kw(x, y=y), x + y)
 
+    def test_fast_path_falls_back_for_sparse(self):
+        @torch.library.custom_op("_torch_testing::fp_sparse", mutates_args=())
+        def fp_sparse(x: Tensor) -> Tensor:
+            return x.to_dense().clone()
+
+        x = torch.randn(3, 3).to_sparse()
+        result = fp_sparse(x)
+        self.assertEqual(result, x.to_dense())
+
+    def test_fast_path_falls_back_for_meta(self):
+        @torch.library.custom_op("_torch_testing::fp_meta", mutates_args=())
+        def fp_meta(x: Tensor) -> Tensor:
+            return x.clone()
+
+        @fp_meta.register_fake
+        def _(x):
+            return torch.empty_like(x)
+
+        x = torch.randn(3, device="meta")
+        result = fp_meta(x)
+        self.assertEqual(result.shape, x.shape)
+        self.assertEqual(result.device, x.device)
+
     def test_custom_op_fast_path_check_c_api(self):
         args = (torch.randn(4), torch.randn(4))
         result = torch._C._custom_op_fast_path_check(args, False)
@@ -4870,6 +4893,11 @@ class TestCustomOpFastPath(TestCase):
         with MyMode():
             result = torch._C._custom_op_fast_path_check(args, False)
             self.assertIsNone(result)
+
+    def test_custom_op_fast_path_check_rejects_sparse(self):
+        sparse = torch.randn(3, 3).to_sparse()
+        result = torch._C._custom_op_fast_path_check((sparse,), False)
+        self.assertIsNone(result)
 
 
 class TestLibrarySourceLocation(TestCase):
