@@ -1184,16 +1184,16 @@ static PyObject* custom_op_fast_path_check(PyObject* _unused, PyObject* args) {
   }
 
   // One-dispatch-key-computation: detect TLS deviation from normal eager.
-  // Normal eager: included = {BackendSelect, ADInplaceOrView},
-  //               excluded = {all autocast keys}.
-  // Extra included keys => functorch, ProxyTorchDispatchMode, etc.
-  // Missing excluded keys => autocast enabled.
+  // Normal eager: included ⊆ {BackendSelect, ADInplaceOrView},
+  //               excluded ⊇ {all autocast keys}.
+  // Use raw bitwise ops to avoid DispatchKeySet::operator- which treats
+  // backend bits specially.
   auto tls = c10::impl::tls_local_dispatch_key_set();
-  c10::DispatchKeySet extra_included =
-      tls.included_ - c10::default_included_set;
-  c10::DispatchKeySet missing_excluded =
-      c10::default_excluded_set - tls.excluded_;
-  if (extra_included.raw_repr() != 0 || missing_excluded.raw_repr() != 0) {
+  uint64_t inc = tls.included_.raw_repr();
+  uint64_t exc = tls.excluded_.raw_repr();
+  uint64_t default_inc = c10::default_included_set.raw_repr();
+  uint64_t default_exc = c10::default_excluded_set.raw_repr();
+  if ((inc & ~default_inc) != 0 || (default_exc & ~exc) != 0) {
     Py_RETURN_NONE;
   }
 
@@ -1214,6 +1214,9 @@ static PyObject* custom_op_fast_path_check(PyObject* _unused, PyObject* args) {
       Py_RETURN_NONE;
     }
     const auto& t = THPVariable_Unpack(obj);
+    if (t.layout() != at::kStrided) {
+      Py_RETURN_NONE;
+    }
     auto dev = t.device().type();
     if (!seen_tensor) {
       first_device = dev;
