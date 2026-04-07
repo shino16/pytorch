@@ -806,9 +806,6 @@ class CustomOpDef:
 
             if device_type == "meta" or device_type in disabled_kernel:
                 return _FAST_PATH_FALLBACK
-            fn = raw_fns.get(device_type) or raw_fns.get(None)
-            if fn is None:
-                return _FAST_PATH_FALLBACK
 
             if is_mutable:
                 for idx in mutated_idxs:
@@ -817,6 +814,10 @@ class CustomOpDef:
 
             if torch.is_grad_enabled() and any_requires_grad:
                 return Generated.apply(*args)  # type: ignore[attr-defined]
+
+            fn = raw_fns.get(device_type) or raw_fns.get(None)
+            if fn is None:
+                return _FAST_PATH_FALLBACK
 
             result = fn(*args)
 
