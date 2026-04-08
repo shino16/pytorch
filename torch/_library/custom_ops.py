@@ -712,13 +712,14 @@ class CustomOpDef:
     def _install_fast_call(self):
         """Install a Python fast path that bypasses the C++ dispatcher for
         common eager-mode calls. The fast path requires all of the following:
-        - All args are plain ``torch.Tensor`` (no subclasses).
+        - All positional args are plain ``torch.Tensor`` (no subclasses).
         - No ``TorchFunctionMode`` is active.
         - No autocast is active.
         - Device is not ``"meta"`` and the kernel is not disabled.
         - The TLS dispatch include set is a subset of the normal eager set
           (covers ``inference_mode``; excludes Functionalize, Vmap, etc.).
         - The schema has no tensor-list args and is not a view op.
+        Keyword-only args (non-tensor) are passed through to the kernel.
         When any condition fails, ``fast_call`` returns ``_FAST_PATH_FALLBACK``
         and the call falls through to the C++ dispatcher."""
         schema = self._opoverload._schema
@@ -746,16 +747,22 @@ class CustomOpDef:
         op_name = self._name
         has_kwarg_only_args = utils.has_kwarg_only_args(schema)
 
-        def forward(ctx, *args):
+        def forward(ctx, *args_and_kwargs):
+            # Last element is the kwargs dict packed by fast_call.
+            kwargs = args_and_kwargs[-1]
+            args = args_and_kwargs[:-1]
+
             with _C._AutoDispatchBelowAutograd():
                 device_type = args[0].device.type
                 fn = raw_fns.get(device_type) or raw_fns.get(None)
-                result = fn(*args)  # pyrefly: ignore[not-callable]
+                result = fn(*args, **kwargs)  # pyrefly: ignore[not-callable]
 
-            utils._c_check_aliasing_constraint(op_name, args, {}, result)
+            utils._c_check_aliasing_constraint(op_name, args, kwargs, result)
 
             if opdef._setup_context_fn:
-                filled_args, filled_kwargs = utils.fill_defaults(op._schema, args, {})
+                filled_args, filled_kwargs = utils.fill_defaults(
+                    op._schema, args, kwargs
+                )
                 if has_kwarg_only_args:
                     opdef._setup_context_fn(
                         ctx=ctx,
@@ -770,7 +777,16 @@ class CustomOpDef:
 
         def backward(ctx, *grads):
             if opdef._backward_fn:
-                return opdef._backward_fn(ctx, *grads)
+                prev = ctx.needs_input_grad
+                try:
+                    # Strip the extra slot from the kwargs dict.
+                    ctx.needs_input_grad = prev[:-1]
+                    result = opdef._backward_fn(ctx, *grads)
+                finally:
+                    ctx.needs_input_grad = prev
+                if isinstance(result, tuple):
+                    return (*result, None)
+                return result, None
             raise RuntimeError(
                 f"Trying to backward through {op} but no autograd "
                 f"formula was registered. "
@@ -792,7 +808,7 @@ class CustomOpDef:
             # Dynamo needs the fake impl and dispatcher.
             if torch.compiler.is_compiling():
                 return _FAST_PATH_FALLBACK
-            if not args or kwargs:
+            if not args:
                 return _FAST_PATH_FALLBACK
 
             # Single C++ call that checks: TorchFunctionMode, dispatch
@@ -816,11 +832,12 @@ class CustomOpDef:
                         increment_version(args[idx])
 
             if torch.is_grad_enabled() and any_requires_grad:
-                return Generated.apply(*args)  # type: ignore[attr-defined]
+                # Pack kwargs as the last arg; forward() unpacks it.
+                return Generated.apply(*args, kwargs)  # type: ignore[attr-defined]
 
-            result = fn(*args)
+            result = fn(*args, **kwargs)
 
-            utils._c_check_aliasing_constraint(op_name, args, {}, result)
+            utils._c_check_aliasing_constraint(op_name, args, kwargs, result)
             return result
 
         self._fast_call = fast_call
