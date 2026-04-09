@@ -3996,6 +3996,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             line = f"tl.store({var} + ({indexing_str}), {value}, {indexing.mask_str})"
         elif mode == "atomic_add":
             self.atomic_add_found = True
+            # Constant-index stores skip masking, but atomic_add accumulates
+            # so OOB threads must be masked out.
+            if is_sympy_integer_like(index) and not indexing.has_mask():
+                for tree in self.range_trees:
+                    if not tree.is_reduction and not self._has_constant_mask(tree):
+                        indexing.mask_vars.add(f"{tree.prefix}mask")
             indexing_str = indexing.index_str
             if (
                 is_sympy_integer_like(index)
