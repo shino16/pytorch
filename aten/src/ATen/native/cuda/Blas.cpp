@@ -12,6 +12,7 @@
 #include <ATen/OpMathType.h>
 #include <ATen/TensorUtils.h>
 #include <ATen/cuda/CUDABlas.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <ATen/native/ScaledBlasUtils.h>
 #include <ATen/cuda/tunable/Tunable.h>
 #include <ATen/cuda/tunable/TunableGemm.h>
@@ -46,6 +47,7 @@
 #include <ATen/ops/dot_native.h>
 #include <ATen/ops/empty.h>
 #include <ATen/ops/empty_strided.h>
+#include <ATen/ops/sum.h>
 #include <ATen/ops/gelu.h>
 #include <ATen/ops/max.h>
 #include <ATen/ops/mm_native.h>
@@ -734,6 +736,15 @@ Tensor dot_cuda(const Tensor& self, const Tensor& other) {
     return at::_efficientzerotensor({}, self.options());
   }
 
+  // cuBLAS dot crashes with SIGFPE on Blackwell (sm_120) with CUDA 12.8.
+  // Fall back to elementwise mul + sum which uses a different kernel path.
+  // https://github.com/pytorch/pytorch/issues/178038
+#if !defined(USE_ROCM) && CUDA_VERSION < 13000
+  if (at::cuda::getCurrentDeviceProperties()->major >= 10) {
+    return at::sum(at::mul(self, other));
+  }
+#endif
+
   return AT_DISPATCH_FLOATING_AND_COMPLEX_TYPES_AND2(
       ScalarType::Half, ScalarType::BFloat16,
       self.scalar_type(), "dot",
@@ -784,6 +795,13 @@ Tensor vdot_cuda(const Tensor& self, const Tensor& other) {
     incx = 1;
     incy = 1;
   }
+
+  // Same cuBLAS Blackwell workaround as dot_cuda above.
+#if !defined(USE_ROCM) && CUDA_VERSION < 13000
+  if (at::cuda::getCurrentDeviceProperties()->major >= 10) {
+    return at::sum(at::mul(self.conj(), other));
+  }
+#endif
 
   return AT_DISPATCH_COMPLEX_TYPES(self.scalar_type(), "vdot", [&] {
     Tensor result = at::empty({}, self.options());

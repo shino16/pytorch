@@ -3968,6 +3968,34 @@ class TestLinalg(TestCase):
     def test_dot_vs_numpy(self, device, dtype):
         self._test_dot_vdot_vs_numpy(device, dtype, torch.dot, np.dot)
 
+    @onlyCUDA
+    @dtypes(torch.float, torch.double, torch.cfloat, torch.cdouble, torch.half, torch.bfloat16)
+    @precisionOverride({torch.half: 5e-2, torch.bfloat16: 1e-1,
+                        torch.float: 5e-5, torch.double: 1e-10,
+                        torch.cfloat: 1e-4, torch.cdouble: 1e-10})
+    def test_dot_vdot_all_dtypes_cuda(self, device, dtype):
+        # Regression test for https://github.com/pytorch/pytorch/issues/178038
+        # cuBLAS dot crashed with SIGFPE on Blackwell (sm_120) with CUDA 12.8
+        for n in [0, 1, 4, 128, 5000]:
+            x = 0.1 * torch.randn(n, dtype=dtype, device=device)
+            y = 0.1 * torch.randn(n, dtype=dtype, device=device)
+            res = torch.dot(x, y)
+            ref = (x * y).sum()
+            self.assertEqual(res, ref)
+
+        # Strided
+        x = 0.1 * torch.randn(200, dtype=dtype, device=device)
+        y = 0.1 * torch.randn(200, dtype=dtype, device=device)
+        self.assertEqual(torch.dot(x[::2], y[::2]), (x[::2] * y[::2]).sum())
+
+        if dtype.is_complex:
+            for n in [0, 1, 4, 128, 5000]:
+                x = 0.1 * torch.randn(n, dtype=dtype, device=device)
+                y = 0.1 * torch.randn(n, dtype=dtype, device=device)
+                res = torch.vdot(x, y)
+                ref = (x.conj() * y).sum()
+                self.assertEqual(res, ref)
+
     @dtypes(torch.float, torch.cfloat)
     @precisionOverride({torch.cfloat: 1e-4, torch.float32: 5e-5})
     def test_vdot_vs_numpy(self, device, dtype):
