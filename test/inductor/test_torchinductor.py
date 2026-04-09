@@ -4261,6 +4261,30 @@ class CommonTemplate:
             check_lowp=False,
         )
 
+    def test_bmm_batched_dot_decompose(self):
+        # bmm with m=1 AND n=1 (batched dot from vmap'd torch.dot) should
+        # decompose to pointwise mul + sum, avoiding extern_kernels.bmm.
+        def fn(a, b):
+            return torch.bmm(a, b)
+
+        def fn2(a, b):
+            return torch.bmm(a, b) + 1
+
+        # (B, 1, K) @ (B, K, 1) — batched dot product
+        for test_fn, shapes in [
+            (fn, ((64, 1, 3), (64, 3, 1))),
+            (fn, ((64, 1, 4), (64, 4, 1))),
+            (fn2, ((32, 1, 8), (32, 8, 1))),
+        ]:
+            args = tuple(torch.randn(*s) for s in shapes)
+            self.common(test_fn, args, check_lowp=False)
+
+            args_dev = tuple(a.to(self.device) for a in args)
+            compiled = torch.compile(test_fn, fullgraph=True)
+            _, code = run_and_get_code(compiled, *args_dev)
+            code_str = "\n".join(code)
+            self.assertNotIn("extern_kernels.bmm", code_str)
+
     @skipIfPy312  # segfaults
     @skipCUDAIf(not SM80OrLater, "Requires sm80")
     def test_mixed_mm(self):

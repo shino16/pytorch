@@ -81,8 +81,25 @@ def tuned_bmm(mat1, mat2, out_dtype=None, *, layout=None):
     """
     Lowering for autotuning aten.bmm with different backends (Aten, Triton, CUTLASS, etc.)
     """
+    # Decompose batched dot product (m=1 AND n=1, small K) to pointwise
+    # mul + sum.  This is the pattern from vmap'd torch.dot:
+    # (B,1,K)@(B,K,1)->(B,1,1).  Avoids extern kernel dispatch overhead
+    # and lets Inductor fuse with surrounding ops.  Restricted to small K
+    # because cuBLAS has better reduction throughput for large K.
+    _BMM_DOT_K_THRESHOLD = 32
+    if out_dtype is None and (
+        V.graph.sizevars.statically_known_leq(mat1.get_size()[1], 1)
+        and V.graph.sizevars.statically_known_leq(mat2.get_size()[2], 1)
+        and V.graph.sizevars.statically_known_leq(
+            mat1.get_size()[2], _BMM_DOT_K_THRESHOLD
+        )
+    ):
+        mat1 = L.unsqueeze(mat1, -1)
+        mat2 = L.unsqueeze(mat2, 1)
+        return L.sum_(L.mul(mat1, mat2), axis=2)
+
     if all(x.get_device().type == "cpu" for x in [mat1, mat2]):
-        # decompose to small ops when memory bound
+        # CPU: also decompose gemv (m=1 OR n=1) — memory-bound, no cuBLAS.
         if mat1.get_size()[1] == 1 or mat2.get_size()[2] == 1:
             mat1 = L.unsqueeze(mat1, -1)
             mat2 = L.unsqueeze(mat2, 1)
