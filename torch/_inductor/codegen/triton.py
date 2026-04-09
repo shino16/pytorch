@@ -3368,14 +3368,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 expand_shape = tuple([1] * len(self.dense_size_list()))
 
             index_str = f"tl.full({expand_str}, {index_str}, tl.int32)"
-            if self.fixed_config or self.is_combo_kernel:
-                mask_vars = OrderedSet(
-                    f"{tree.prefix}mask"
-                    for tree in self.range_trees
-                    if not tree.is_reduction and not self._has_constant_mask(tree)
-                )
-            else:
-                mask_vars = OrderedSet()
+            mask_vars = OrderedSet(
+                f"{tree.prefix}mask"
+                for tree in self.range_trees
+                if not tree.is_reduction and not self._has_constant_mask(tree)
+            )
             if self._load_mask:
                 mask_vars.add(self._load_mask)
             return IndexingOptions(
