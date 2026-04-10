@@ -869,15 +869,23 @@ def grid_sampler_2d(
     padding_mode: int = 0,
     align_corners: bool = False,
 ) -> torch.Tensor:
-    # We do not expand the grid (_expand_grid=False) on cpu for performance reasons
-    # Experimenting locally it was found that compiled CUDA code is accelerated by ~5x
-    # and CPU code by ~2x on bicubic mode, if we expand the grid from (N, H, W, 2) into (N, C, H, W, 2)
-    # However, this leads to a slowdown around ~0.8x on CPU bilinear mode, channels first.
-    # Thus we apply this hack to not expand the grid for this case.
+    # Grid expansion (_expand_grid) broadcasts (N, H, W, 2) to (N, C, H, W, 2),
+    # unifying xnumel so Inductor emits a single fused kernel.  This helps
+    # bicubic/nearest modes (~5x on CUDA, ~2x on CPU) but hurts bilinear:
+    #   - CPU bilinear channels-first: ~0.8x slower (original finding)
+    #   - GPU bilinear: up to 1.2x slower (measured on CUDA) due to C×
+    #     replicated grid reads; without expansion the grid coords and weights
+    #     are computed once per spatial position and reused across channels
+    #     (see pytorch#103475).
     _expand_grid = not (
-        a.device == torch.device("cpu")
-        and interpolation_mode == 0
-        and a.is_contiguous(memory_format=torch.contiguous_format)
+        interpolation_mode == 0
+        and (
+            (
+                a.device == torch.device("cpu")
+                and a.is_contiguous(memory_format=torch.contiguous_format)
+            )
+            or is_gpu(a.device.type)
+        )
     )
 
     output = decomp_grid_sampler_2d(
