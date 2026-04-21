@@ -1261,6 +1261,59 @@ static PyObject* custom_op_fast_path_check(
   END_HANDLE_TH_ERRORS
 }
 
+// Bulk version bump for fast-path mutable custom ops.
+//
+// Called as _custom_op_increment_versions(args_tuple, mutated_idxs_tuple).
+// Bumps each Tensor at the given positional indices, skipping inference
+// tensors. The fast path excludes tensorlist args, so every mutated arg
+// is a single Tensor by construction.
+//
+// Equivalent to the Python loop
+//   for idx in mutated_idxs: increment_version(args[idx])
+// but collapses N Python->C crossings (plus the torch._library ->
+// torch.autograd.graph wrapper chain) into a single call.
+static PyObject* custom_op_increment_versions(
+    PyObject* self,
+    PyObject* const* args,
+    Py_ssize_t nargs) {
+  HANDLE_TH_ERRORS
+  TORCH_CHECK_VALUE(
+      nargs == 2,
+      "_custom_op_increment_versions expects 2 arguments, got ",
+      nargs);
+  PyObject* tensors = args[0];
+  PyObject* idxs = args[1];
+  TORCH_CHECK(PyTuple_Check(tensors), "args must be a tuple");
+  TORCH_CHECK(PyTuple_Check(idxs), "mutated_idxs must be a tuple");
+  Py_ssize_t n_idxs = PyTuple_GET_SIZE(idxs);
+  Py_ssize_t n_tensors = PyTuple_GET_SIZE(tensors);
+  for (Py_ssize_t i = 0; i < n_idxs; i++) {
+    Py_ssize_t idx = PyLong_AsSsize_t(PyTuple_GET_ITEM(idxs, i));
+    if (idx == -1 && PyErr_Occurred()) {
+      return nullptr;
+    }
+    TORCH_CHECK(
+        idx >= 0 && idx < n_tensors,
+        "mutated index ",
+        idx,
+        " out of range [0, ",
+        n_tensors,
+        ")");
+    PyObject* t_obj = PyTuple_GET_ITEM(tensors, idx);
+    TORCH_CHECK(
+        THPVariable_Check(t_obj),
+        "arg at mutated index ",
+        idx,
+        " is not a Tensor");
+    const auto& t = THPVariable_Unpack(t_obj);
+    if (!t.is_inference()) {
+      torch::autograd::increment_version(t);
+    }
+  }
+  Py_RETURN_NONE;
+  END_HANDLE_TH_ERRORS
+}
+
 static PyObject* set_multithreading_enabled(
     PyObject* self,
     PyObject* args,
@@ -1793,6 +1846,10 @@ static PyMethodDef methods[] = {
      METH_NOARGS,
      nullptr},
     {"_custom_op_fast_path_check", custom_op_fast_path_check, METH_O, nullptr},
+    {"_custom_op_increment_versions",
+     castPyCFunctionFast(custom_op_increment_versions),
+     METH_FASTCALL,
+     nullptr},
     {"_set_dispatch_mode", set_dispatch_mode, METH_O, nullptr},
     {"_get_dispatch_mode", get_dispatch_mode, METH_O, nullptr},
     {"_unset_dispatch_mode", unset_dispatch_mode, METH_O, nullptr},

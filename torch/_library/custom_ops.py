@@ -811,9 +811,7 @@ class CustomOpDef:
                 return _FAST_PATH_FALLBACK
 
             if is_mutable:
-                for idx in mutated_idxs:
-                    if not args[idx].is_inference():
-                        increment_version(args[idx])
+                _C._custom_op_increment_versions(args, mutated_idxs)
 
             if torch.is_grad_enabled() and any_requires_grad:
                 return Generated.apply(*args)  # type: ignore[attr-defined]
