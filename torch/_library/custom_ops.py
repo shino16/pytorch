@@ -10,6 +10,7 @@ from typing import Any, overload, Union
 
 import torch
 from torch import _C, _ops, Tensor
+from torch._ops import _FAST_PATH_FALLBACK
 from torch.types import _dtype
 from torch.utils._exposed_in import exposed_in
 
@@ -19,8 +20,6 @@ from .effects import EffectType
 
 device_types_t = str | Sequence[str] | None
 log = logging.getLogger(__name__)
-
-_FAST_PATH_FALLBACK = object()
 
 
 @overload
@@ -825,22 +824,15 @@ class CustomOpDef:
 
         self._fast_call = fast_call
 
-        packet = self._opoverload._overloadpacket
-        # Save the original C++ dispatcher entry point once, so repeated
-        # _install_fast_call invocations (e.g. registering kernels for
-        # different devices) don't create nested fast_op wrappers.
-        if not hasattr(packet, "_orig_op"):
-            packet._orig_op = packet._op  # pyrefly: ignore[missing-attribute]
-
-        def fast_op(*args, **kwargs):
-            result = fast_call(*args, **kwargs)
-            if result is not _FAST_PATH_FALLBACK:
-                return result
-            return packet._orig_op(
-                *args, **kwargs
-            )  # pyrefly: ignore[missing-attribute]
-
-        packet._op = fast_op
+        # Route `torch.ops.ns.name[.default](x)` through `fast_call` by
+        # upgrading the overload/packet classes. See `_ops.FastPathOpOverload`.
+        overload = self._opoverload
+        overload._fast_call = fast_call  # pyrefly: ignore[missing-attribute]
+        if type(overload) is _ops.OpOverload:
+            overload.__class__ = _ops.FastPathOpOverload
+        packet = overload._overloadpacket
+        if type(packet) is _ops.OpOverloadPacket:
+            packet.__class__ = _ops.FastPathOpOverloadPacket
 
     def _register_backend_select_dispatcher(self, device_arg_index: int):
         """

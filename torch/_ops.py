@@ -1133,6 +1133,24 @@ class TorchBindOpOverload(OpOverload[_P, _T]):
         return handler(*args, **kwargs)
 
 
+# Sentinel returned by `_fast_call` when the call must fall back to C++.
+_FAST_PATH_FALLBACK = object()
+
+
+# Overload whose __call__ tries a Python fast path before the C++ dispatcher.
+# `custom_op` installs `_fast_call` and swaps in this class at registration time.
+class FastPathOpOverload(OpOverload[_P, _T]):
+    _fast_call: Callable  # set by `CustomOpDef._install_fast_call`
+
+    # Use positional-only argument to avoid naming collision with aten ops arguments
+    # that are named "self". This way, all the aten ops can be called by kwargs.
+    def __call__(self, /, *args: _P.args, **kwargs: _P.kwargs) -> _T:
+        result = self._fast_call(*args, **kwargs)
+        if result is not _FAST_PATH_FALLBACK:
+            return result
+        return self._op(*args, **kwargs)
+
+
 def _contains_fake_script_object(obj) -> bool:
     """Check if obj is or contains a FakeScriptObject.
     This is load-bearing for TorchBindOpOverloads so we avoid pytree
@@ -1277,6 +1295,17 @@ class OpOverloadPacket(Generic[_P, _T]):
     # TODO: use this to make a __dir__
     def overloads(self):
         return [n if n else "default" for n in self._overload_names]
+
+
+# Packet counterpart so `torch.ops.ns.name(x)` hits the fast path too.
+class FastPathOpOverloadPacket(OpOverloadPacket[_P, _T]):
+    # Use positional-only argument to avoid naming collision with aten ops arguments
+    # that are named "self". This way, all the aten ops can be called by kwargs.
+    def __call__(self, /, *args: _P.args, **kwargs: _P.kwargs) -> _T:
+        # Multi-overload packets need schema-based dispatch; let super() pick.
+        if len(self._overload_names) != 1:
+            return super().__call__(*args, **kwargs)
+        return self.default(*args, **kwargs)  # type: ignore[attr-defined]
 
 
 # Note - this mirrors the logic of the cpp_function defined in jit/python/init.cpp

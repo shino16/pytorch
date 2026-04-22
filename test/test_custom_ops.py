@@ -4571,8 +4571,8 @@ class TestCustomOpFastPath(TestCase):
     def _assert_fast_path_taken(self, opdef):
         """Replace the C++ dispatcher fallback with one that errors, so the
         test fails if the fast path doesn't handle the call."""
-        packet = opdef._opoverload._overloadpacket
-        saved_orig = packet._orig_op
+        overload = opdef._opoverload
+        saved_op = overload._op
         saved_overload = opdef._opoverload
 
         def poison(*a, **kw):
@@ -4580,15 +4580,17 @@ class TestCustomOpFastPath(TestCase):
                 "slow path was called; fast path should have handled this"
             )
 
-        # Poison both fallback paths:
-        # - packet._orig_op: read by fast_op for the torch.ops.* call path
-        # - opdef._opoverload: used by CustomOpDef.__call__ for the direct path
-        packet._orig_op = poison
+        # Poison two fallback paths:
+        # - overload._op: read by `FastPathOpOverload.__call__` fallback; covers
+        #   both `torch.ops.ns.name(x)` and `torch.ops.ns.name.default(x)`
+        # - opdef._opoverload: used by `CustomOpDef.__call__` fallback for
+        #   direct `my_op(x)`
+        overload._op = poison
         opdef._opoverload = poison
         try:
             yield
         finally:
-            packet._orig_op = saved_orig
+            overload._op = saved_op
             opdef._opoverload = saved_overload
 
     def test_fast_path_basic(self):
@@ -4601,6 +4603,7 @@ class TestCustomOpFastPath(TestCase):
         with self._assert_fast_path_taken(fp_add):
             self.assertEqual(fp_add(x, y), x + y)
             self.assertEqual(torch.ops._torch_testing.fp_add(x, y), x + y)
+            self.assertEqual(torch.ops._torch_testing.fp_add.default(x, y), x + y)
 
     def test_fast_path_mutable(self):
         @torch.library.custom_op("_torch_testing::fp_inplace", mutates_args={"x"})
@@ -4812,19 +4815,19 @@ class TestCustomOpFastPath(TestCase):
         def _(x):
             return torch.empty_like(x)
 
-        packet = torch.ops._torch_testing.fp_chain.default._overloadpacket
-        orig = packet._orig_op
+        overload = torch.ops._torch_testing.fp_chain.default
+        orig_op = overload._op
 
         @fp_chain.register_kernel("cuda")
         def _(x: Tensor) -> Tensor:
             return x.clone()
 
-        # After a second register_kernel, the fallback should still be the
-        # original C++ entry point, not a nested fast_op wrapper.
-        self.assertIs(packet._orig_op, orig)
+        # The subclass-based fast path overrides `__call__` rather than
+        # wrapping `_op`, so repeated installs shouldn't mutate `_op` at all.
+        self.assertIs(overload._op, orig_op)
 
         # Exercise the fallback path (meta tensor forces fast_call to bail)
-        # to verify it reaches the real C++ dispatcher, not a stale wrapper.
+        # to verify it reaches the real C++ dispatcher.
         x_meta = torch.randn(3, device="meta")
         result = torch.ops._torch_testing.fp_chain(x_meta)
         self.assertEqual(result.shape, x_meta.shape)
