@@ -2102,6 +2102,7 @@ void THCPEvent_init(PyObject* module);
 void THCPGraph_init(PyObject* module);
 void THCPMemPool_init(PyObject* module);
 void THCPGreenContext_init(PyObject* module);
+void THCPLocalizedGreenContextMemPool_init(PyObject* module);
 PyMethodDef* THCPModule_methods();
 namespace torch::cuda {
 void initModule(PyObject* module);
@@ -2336,6 +2337,7 @@ PyObject* initModule() {
   THCPGraph_init(module);
   THCPMemPool_init(module);
   THCPGreenContext_init(module);
+  THCPLocalizedGreenContextMemPool_init(module);
 #endif
 
 #ifdef USE_XPU

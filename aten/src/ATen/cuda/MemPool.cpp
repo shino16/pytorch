@@ -23,8 +23,8 @@ MemPool::MemPool(
     HookFnT on_begin_allocate,
     HookFnT on_end_allocate)
     : is_user_created_(is_user_created),
-    on_begin_allocate_(std::move(on_begin_allocate)),
-    on_end_allocate_(std::move(on_end_allocate)) {
+      on_begin_allocate_(std::move(on_begin_allocate)),
+      on_end_allocate_(std::move(on_end_allocate)) {
   if (is_user_created_) {
     id_ = {0, uid_++};
   } else {

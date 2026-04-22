@@ -8,7 +8,6 @@
 #include <c10/cuda/CUDAStream.h>
 #include <c10/util/Exception.h>
 #include <c10/util/Registry.h>
-#include <c10/util/UniqueVoidPtr.h>
 
 #include <atomic>
 #include <cstddef>
@@ -58,19 +57,6 @@ using c10::CachingDeviceAllocator::DeviceStats;
 using c10::CachingDeviceAllocator::RecordContext;
 using c10::CachingDeviceAllocator::SegmentInfo;
 using c10::CachingDeviceAllocator::TraceEntry;
-
-// Abstract backend for the native allocator's low-level allocate/free.
-// Implementations can be provided by C++ or the python process.
-struct C10_CUDA_API NativeAllocatorBackend {
-  virtual void* allocate(
-      size_t size,
-      c10::DeviceIndex device,
-      cudaStream_t stream) = 0;
-  virtual void free(void* ptr) = 0;
-  virtual c10::DeleterFnPtr get_deleter() const = 0;
-  virtual std::string name() const = 0;
-  virtual ~NativeAllocatorBackend() = default;
-};
 
 struct AllocatorState {
   virtual ~AllocatorState() = default;
@@ -499,14 +485,6 @@ inline void setUserMetadata(const std::string& metadata) {
 inline std::string getUserMetadata() {
   return get()->getUserMetadata();
 }
-
-// Native allocator backend get/set. Only apply when the current allocator is
-// the native one (name() == "native"). When PYTORCH_NO_CUDA_MEMORY_CACHING is
-// set, set_backend and reset are no-ops. The backend pointer is not owned;
-// the caller (e.g. Python) must keep the backend alive.
-C10_CUDA_API std::string getNativeAllocatorBackendName();
-C10_CUDA_API void setNativeAllocatorBackend(NativeAllocatorBackend* backend);
-C10_CUDA_API void resetNativeAllocatorBackendToCaching();
 
 } // namespace c10::cuda::CUDACachingAllocator
 

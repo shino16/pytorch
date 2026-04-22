@@ -1,4 +1,5 @@
 #include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/NativeAllocatorBackend.h>
 
 #include <c10/core/impl/GPUTrace.h>
 #include <c10/cuda/CUDAAllocatorConfig.h>
@@ -4193,6 +4194,11 @@ class NativeCachingAllocator : public CUDAAllocator {
       size_t size,
       cudaStream_t stream) {
     *devPtr = caching_backend_.allocate(size, device, stream);
+    const c10::impl::PyInterpreter* interp = c10::impl::GPUTrace::get_trace();
+    if (C10_UNLIKELY(interp && *devPtr)) {
+      (*interp)->trace_gpu_memory_allocation(
+          c10::kCUDA, reinterpret_cast<uintptr_t>(*devPtr));
+    }
   }
 
   void free(void* ptr) {

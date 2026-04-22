@@ -1,281 +1,104 @@
 #include <ATen/cuda/CUDAGreenContext.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDAGreenContextMacros.h>
 
-#if defined(CUDA_VERSION) && CUDA_VERSION >= 12080 && !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
+#if HAS_CUDA_GREEN_CONTEXT()
 #include <c10/cuda/driver_api.h>
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
-#define HAS_CUDA_GREEN_CONTEXT() 1
 #else
-#define HAS_CUDA_GREEN_CONTEXT() 0
 // Suppress unused private field warnings as this class is not supposed to be called
 C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED("-Wunused-private-field")
 #endif
 
-#if HAS_CUDA_GREEN_CONTEXT() == 1 && CUDA_VERSION >= 13040
-#define HAS_CUDA_GREEN_CONTEXT_LOCALIZATION() 1
-#else
-#define HAS_CUDA_GREEN_CONTEXT_LOCALIZATION() 0
-#endif
-
 namespace at::cuda {
 
-namespace {
-
-// helper function to create a green context from a resource
-void create_green_ctx_from_resource(
-    CUgreenCtx& green_ctx,
-    CUcontext& context,
-    CUdevice device,
-    CUdevResource& resource) {
-#if HAS_CUDA_GREEN_CONTEXT()
-  CUdevResourceDesc desc;
-  C10_CUDA_DRIVER_CHECK(
-      c10::cuda::DriverAPI::get()->cuDevResourceGenerateDesc_(
-          &desc, &resource, 1));
-  // CU_GREEN_CTX_DEFAULT_STREAM is required per docs:
-  // https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__GREEN__CONTEXTS.html
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuGreenCtxCreate_(
-      &green_ctx, desc, device, CU_GREEN_CTX_DEFAULT_STREAM));
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuCtxFromGreenCtx_(
-      &context, green_ctx));
-  TORCH_CHECK(context, "Green ctx conversion to regular ctx failed!");
-#endif
-}
-
-}  // namespace
-
-uint32_t get_num_memory_nodes(uint32_t device_id) {
+uint32_t get_num_locality_domains(std::optional<uint32_t> device_id) {
 #if HAS_CUDA_GREEN_CONTEXT_LOCALIZATION()
+  int driver_version;
+  C10_CUDA_CHECK(cudaDriverGetVersion(&driver_version));
+  TORCH_CHECK(
+      driver_version >= 13040, "cuda driver too old to use green context localization!");
+  if (!device_id.has_value()) {
+    device_id = at::cuda::current_device();
+  }
   CUdevice device;
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuDeviceGet_(&device, device_id));
+  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuDeviceGet_(&device, device_id.value()));
   int count = 0;
   C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuDeviceGetAttribute_(
     &count, CU_DEVICE_ATTRIBUTE_MEMORY_NODE_COUNT, device));
   return static_cast<uint32_t>(count);
 #else
-  TORCH_CHECK(false, "get_num_memory_nodes is only supported on CUDA 13.4+!");
+  TORCH_CHECK(false, "get_num_locality_domains is only supported on CUDA 13.4+!");
   return 0;
 #endif
 }
 
-GreenContext::GreenContext(int32_t device_id, int32_t memory_node_id, int32_t num_memory_nodes)
-#if HAS_CUDA_GREEN_CONTEXT_LOCALIZATION()
-    : device_id_(device_id), memory_node_id_(memory_node_id), num_memory_nodes_(num_memory_nodes) { }
-#else
-  {
-    TORCH_CHECK(false, "Green Context localization is only supported on CUDA 13.4+!");
-  }
-#endif
-
-GreenContext::GreenContext(uint32_t device_id, uint32_t num_sms) {
-#if HAS_CUDA_GREEN_CONTEXT()
-  int driver_version;
-  C10_CUDA_CHECK(cudaDriverGetVersion(&driver_version));
-  TORCH_CHECK(
-      driver_version >= 12080, "cuda driver too old to use green context!");
-  CUcontext pctx = nullptr;
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuCtxGetCurrent_(&pctx));
-  if (C10_UNLIKELY(!pctx)) {
-    TORCH_WARN(
-        "Attempted to create a green context but"
-        " there was no primary context! Creating a primary context...");
-
-    cudaFree(nullptr);
-  }
-
-  CUdevice device;
-  device_id_ = device_id;
-  C10_CUDA_DRIVER_CHECK(
-      c10::cuda::DriverAPI::get()->cuDeviceGet_(&device, device_id));
-
-  // Get device resources
-  CUdevResource device_resource;
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuDeviceGetDevResource_(
-      device, &device_resource, CU_DEV_RESOURCE_TYPE_SM));
-
-  TORCH_CHECK(
-      num_sms > 0 && num_sms <= device_resource.sm.smCount,
-      "Invalid number of SMs requested for green context: ",
-      num_sms,
-      " (device has ",
-      device_resource.sm.smCount,
-      " SMs)");
-
-  // Split resources
-  std::vector<CUdevResource> result(1);
-  auto result_data = result.data();
-  unsigned int nb_groups = 1;
-  CUdevResource remaining;
-
-  C10_CUDA_DRIVER_CHECK(
-      c10::cuda::DriverAPI::get()->cuDevSmResourceSplitByCount_(
-          result_data,
-          &nb_groups,
-          &device_resource,
-          &remaining,
-          0, // default flags
-          num_sms));
-
-  TORCH_CHECK(nb_groups == 1, "Failed to create single resource group");
-
-  create_green_ctx_from_resource(green_ctx_, context_, device, result_data[0]);
-#else
-  TORCH_CHECK(false, "Green Context is only supported on CUDA 12.8+!");
-#endif
-}
-
 std::unique_ptr<GreenContext> GreenContext::create(
-  uint32_t num_sms,
-  std::optional<uint32_t> device_id) {
+  std::optional<uint32_t> device_id,
+  std::optional<uint32_t> num_sms,
+  std::optional<int32_t> workqueue_scope,
+  std::optional<uint32_t> workqueue_concurrency_limit,
+  std::optional<int32_t> locality_domain_id) {
 #if HAS_CUDA_GREEN_CONTEXT()
-  if (!device_id.has_value()) {
-    device_id = at::cuda::current_device();
-  }
-  return std::unique_ptr<GreenContext>(new GreenContext(device_id.value(), num_sms));
-#else
-  TORCH_CHECK(false, "Green Context is only supported on CUDA 12.8+!");
-#endif
-}
-
-std::vector<std::unique_ptr<GreenContext>> GreenContext::create_localized(
-    std::optional<uint32_t> device_id) {
-#if HAS_CUDA_GREEN_CONTEXT_LOCALIZATION()
-  int driver_version = 0;
-  C10_CUDA_CHECK(cudaDriverGetVersion(&driver_version));
+int driver_version;
+C10_CUDA_CHECK(cudaDriverGetVersion(&driver_version));
+TORCH_CHECK(
+    driver_version >= 12080, "cuda driver too old to use green context!");
+if (workqueue_scope.has_value() || workqueue_concurrency_limit.has_value()) {
   TORCH_CHECK(
-      driver_version >= 13040, "cuda driver too old to use localized green contexts!");
+      driver_version >= 13010, "cuda driver too old to use workqueue configuration!");
+}
+if (locality_domain_id.has_value()) {
+  TORCH_CHECK(
+      driver_version >= 13040, "cuda driver too old to use green context localization!");
+}
+if (!device_id.has_value()) {
+  device_id = at::cuda::current_device();
+}
+return std::unique_ptr<GreenContext>(new GreenContext(
+    device_id.value(), num_sms, workqueue_scope, workqueue_concurrency_limit, locality_domain_id));
+#else
+TORCH_CHECK(false, "Green Context is only supported on CUDA 12.8+!");
+return nullptr;
+#endif
+}
 
-  if (!device_id.has_value()) {
-    device_id = at::cuda::current_device();
-  }
-  CUdevResource smResources;
-  CUdevice device;
-  C10_CUDA_DRIVER_CHECK(
+uint32_t GreenContext::max_workqueue_concurrency(
+  std::optional<uint32_t> device_id) {
+#if HAS_CUDA_WORKQUEUE_SUPPORT()
+int driver_version;
+C10_CUDA_CHECK(cudaDriverGetVersion(&driver_version));
+TORCH_CHECK(
+    driver_version >= 13010, "cuda driver too old to use workqueue configuration!");
+if (!device_id.has_value()) {
+  device_id = at::cuda::current_device();
+}
+CUdevice device;
+C10_CUDA_DRIVER_CHECK(
     c10::cuda::DriverAPI::get()->cuDeviceGet_(&device, device_id.value()));
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuDeviceGetDevResource_(
-    device, &smResources, CU_DEV_RESOURCE_TYPE_SM));
-
-  int count = 0;
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuDeviceGetAttribute_(
-    &count, CU_DEVICE_ATTRIBUTE_MEMORY_NODE_COUNT, device));
-  TORCH_CHECK(count > 0, "No memory nodes found on device!");
-
-  std::vector<CUdevResource> localizedSms(count);
-  std::vector<CU_DEV_SM_RESOURCE_GROUP_PARAMS> params(count);
-  for (int i = 0; i < count; i++) {
-      std::memset(params.data() + i, 0, sizeof(params[i]));
-      params[i].smCount = 0; // Use discovery mode of the API to derive SM count
-      params[i].coscheduledSmCount = 2; // The minimum cluster capability: 2 SMs
-      params[i].flags = CU_DEV_SM_RESOURCE_GROUP_MEMORY_NODE_ID;
-      params[i].memoryNodeId = static_cast<unsigned char>(i);
-  }
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuDevSmResourceSplit_(
-    localizedSms.data(), count, &smResources, /*remainder resource*/nullptr, /*flags*/0, params.data()));
-
-  std::vector<std::unique_ptr<GreenContext>> green_contexts(count);
-  for (int i = 0; i < count; i++) {
-    green_contexts[i] = std::unique_ptr<GreenContext>(new GreenContext(device_id.value(), i, count));
-    green_contexts[i]->device_id_ = device_id.value();
-    green_contexts[i]->memory_node_id_ = i;
-    green_contexts[i]->num_memory_nodes_ = count;
-    create_green_ctx_from_resource(
-      green_contexts[i]->green_ctx_, green_contexts[i]->context_, device, localizedSms[i]);
-  }
-  return green_contexts;
+CUdevResource wq_resource;
+C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuDeviceGetDevResource_(
+    device, &wq_resource, CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG));
+return wq_resource.wqConfig.wqConcurrencyLimit;
 #else
-  TORCH_CHECK(false, "Green Context localization is only supported on CUDA 13.4+!");
-#endif
-}
-
-// Implement move operations
-#if HAS_CUDA_GREEN_CONTEXT()
-GreenContext::GreenContext(GreenContext&& other) noexcept
-    : device_id_(std::exchange(other.device_id_, -1)),
-      memory_node_id_(std::exchange(other.memory_node_id_, -1)),
-      num_memory_nodes_(std::exchange(other.num_memory_nodes_, 0)),
-      green_ctx_(std::exchange(other.green_ctx_, nullptr)),
-      context_(std::exchange(other.context_, nullptr)),
-      parent_stream_(std::exchange(other.parent_stream_, nullptr)) {
-  curr_stream_idx_.exchange(other.curr_stream_idx_);
-  std::swap(this->green_ctx_streams_, other.green_ctx_streams_);
-}
-#else
-GreenContext::GreenContext(GreenContext&& other) noexcept {
-  TORCH_CHECK(false, "Green Context move constructor is only supported on CUDA 12.8+!");
-}
-#endif
-
-void GreenContext::destroy_resources() noexcept {
-#if HAS_CUDA_GREEN_CONTEXT()
-  // avoid throwing exceptions on destruction
-  // note: if curr_stream_idx_ was never updated, loop doesn't run
-  for (int i = std::min(curr_stream_idx_.load(), kStreamPerGreenContextPool - 1); i >= 0;
-       i--) {
-    if (!green_ctx_streams_[i]) continue;
-    auto err = c10::cuda::DriverAPI::get()->cuStreamDestroy_(green_ctx_streams_[i]);
-    if (err != CUDA_SUCCESS) {
-      TORCH_WARN(
-          "Failed to destroy green context side stream ",
-          i,
-          " with error code ",
-          static_cast<int>(err));
-    }
-  }
-  if (green_ctx_) {
-    auto err = c10::cuda::DriverAPI::get()->cuGreenCtxDestroy_(green_ctx_);
-    if (err != CUDA_SUCCESS) {
-      TORCH_WARN(
-          "Failed to destroy green context with error code ",
-          static_cast<int>(err));
-    }
-  }
-#endif
-}
-
-GreenContext& GreenContext::operator=(GreenContext&& other) noexcept {
-#if HAS_CUDA_GREEN_CONTEXT()
-  if (this != &other) {
-    // Clean up current resources
-    if (green_ctx_) {
-      CUcontext current = nullptr;
-      C10_CUDA_DRIVER_CHECK(
-          c10::cuda::DriverAPI::get()->cuCtxGetCurrent_(&current));
-      if (current == context_) {
-        TORCH_CHECK(
-            false,
-            "attempting to overwrite current green ctx "
-            "when it is active!");
-      }
-      destroy_resources();
-    }
-
-    // Take ownership of other's resources
-    device_id_ = std::exchange(other.device_id_, -1);
-    memory_node_id_ = std::exchange(other.memory_node_id_, -1);
-    num_memory_nodes_ = std::exchange(other.num_memory_nodes_, 0);
-    green_ctx_ = std::exchange(other.green_ctx_, nullptr);
-    context_ = std::exchange(other.context_, nullptr);
-    parent_stream_ = std::exchange(other.parent_stream_, nullptr);
-    curr_stream_idx_.exchange(other.curr_stream_idx_);
-    std::swap(this->green_ctx_streams_, other.green_ctx_streams_);
-  }
-  return *this;
-#else
-  TORCH_CHECK(false, "Green Context is only supported on CUDA 12.8+!");
+TORCH_CHECK(false, "Workqueue configuration requires CUDA 13.1+!");
+return 0;
 #endif
 }
 
 GreenContext::~GreenContext() noexcept {
-#if HAS_CUDA_GREEN_CONTEXT()
-  destroy_resources();
-#else
-  TORCH_CHECK(false, "Green Context is only supported on CUDA 12.8+!");
-#endif
-}
-
+  #if HAS_CUDA_GREEN_CONTEXT()
+    destroy_resources();
+  #else
+    TORCH_CHECK(false, "Green Context is only supported on CUDA 12.8+!");
+  #endif
+  }
+  
 // Make this context current
 void GreenContext::setContext(bool block_current_stream) {
 #if HAS_CUDA_GREEN_CONTEXT()
@@ -355,6 +178,7 @@ CUDAStream GreenContext::Stream() {
   return c10::cuda::getStreamFromExternal(green_ctx_streams_[idx], device_id_);
 #else
   TORCH_CHECK(false, "Green Context is only supported on CUDA 12.8+!");
+  return c10::cuda::getDefaultCUDAStream();
 #endif
 }
 
@@ -362,453 +186,255 @@ int32_t GreenContext::device_id() const {
   return device_id_;
 }
 
-int32_t GreenContext::memory_node_id() const {
-  return memory_node_id_;
+int32_t GreenContext::locality_domain_id() const {
+  return locality_domain_id_;
 }
 
-bool GreenContext::has_memory_node() const {
-  return memory_node_id_ >= 0;
+bool GreenContext::has_locality_domain() const {
+  return locality_domain_id_ >= 0;
 }
 
-int32_t GreenContext::num_memory_nodes() const {
-  return num_memory_nodes_;
+int32_t GreenContext::num_locality_domains() const {
+  return num_locality_domains_;
 }
 
-#if HAS_CUDA_GREEN_CONTEXT_LOCALIZATION()
-LocalizedGreenContextAllocator::LocalizedGreenContextAllocator(
-    GreenContext* green_context)
-    : torch::cuda::CUDAPluggableAllocator::CUDAPluggableAllocator(
-        [green_context](size_t size, int device, cudaStream_t stream) {
-          return allocate_on_green_context(
-              size, device, stream, green_context);
-        },
-        [green_context](
-            void* ptr, size_t size, int device, cudaStream_t stream) {
-          free_on_green_context(ptr, size, device, stream, green_context);
-        }) {}
-#else
-LocalizedGreenContextAllocator::LocalizedGreenContextAllocator(GreenContext* green_context) {
-  TORCH_CHECK(false, "Green Context localization is only supported on CUDA 13.4+!");
-}
-#endif
-
-void* LocalizedGreenContextAllocator::allocate_on_green_context(
-    size_t size,
-    int device,
-    cudaStream_t stream,
-    GreenContext* green_context) {
-#if HAS_CUDA_GREEN_CONTEXT_LOCALIZATION()
-  TORCH_INTERNAL_ASSERT(green_context, "GreenContext allocator requires a context.");
-  TORCH_CHECK(device == green_context->device_id(),
-    "Device mismatch. Allocator device: ", device,
-    ", GreenContext device: ", green_context->device_id());
-  CUgreenCtx stream_ctx;
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuStreamGetGreenCtx_(
-    stream, &stream_ctx));
-  TORCH_CHECK(stream_ctx == green_context->green_ctx_,
-    "Green context mismatch. Allocator stream ctx: ", stream_ctx,
-    ", GreenContext green ctx: ", green_context->green_ctx_);
-  CUdeviceptr ptr = 0;
-
-  CUmemAllocationProp prop = {};
-  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-  prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE_MEMORY_NODE;
-  prop.location.localized.deviceId = device;
-  prop.location.localized.memoryNodeId = green_context->memory_node_id();
-  size_t granularity = 1;
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemGetAllocationGranularity_(
-    &granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
-  size_t nodePaddedSize = (size + (granularity - 1)) & ~(granularity - 1);
-  CUmemGenericAllocationHandle handle;
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemCreate_(
-    &handle, nodePaddedSize, &prop, /*flags*/0));
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemAddressReserve_(
-    &ptr, nodePaddedSize, granularity, /*addr hint*/0, /*flags*/0));
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemMap_(
-    ptr, nodePaddedSize, /*offset*/0, handle, /*flags*/0));
-  CUmemAccessDesc desc = {};
-  desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-  desc.location.id = device;
-  desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemSetAccess_(
-    ptr, nodePaddedSize, &desc, /*count [#descriptors]*/1));
-
-  return reinterpret_cast<void*>(ptr);
-#endif
-}
-
-void LocalizedGreenContextAllocator::free_on_green_context(
-    void* ptr,
-    size_t size,
-    int device,
-    cudaStream_t stream,
-    GreenContext* green_context) {
-#if HAS_CUDA_GREEN_CONTEXT_LOCALIZATION()
-  TORCH_INTERNAL_ASSERT(green_context, "GreenContext allocator requires a context.");
-  TORCH_CHECK(device == green_context->device_id(),
-    "Device mismatch. Allocator device: ", device,
-    ", GreenContext device: ", green_context->device_id());
-  CUgreenCtx stream_ctx;
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuStreamGetGreenCtx_(
-    stream, &stream_ctx));
-  // while freeing, if we are using the default stream, we might not get
-  // the expected context as it is associated with the primary context as well.
-  // So we allow the default stream here, but in this case, we need to
-  // push and pop the green context context as needed.
-  TORCH_CHECK(stream_ctx == green_context->green_ctx_ || stream == nullptr,
-    "Green context mismatch. Allocator stream ctx: ", stream_ctx,
-    ", GreenContext green ctx: ", green_context->green_ctx_);
-  CUmemAllocationProp prop = {};
-  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-  prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE_MEMORY_NODE;
-  prop.location.localized.deviceId = device;
-  prop.location.localized.memoryNodeId = green_context->memory_node_id();
-  size_t granularity = 1;
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemGetAllocationGranularity_(
-    &granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
-  size_t paddedSize = (size + (granularity - 1)) & ~(granularity - 1);
-
-  CUmemGenericAllocationHandle handle;
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemRetainAllocationHandle_(
-    &handle, ptr));
-
-  if (stream_ctx != green_context->green_ctx_) {
-    C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuCtxPushCurrent_(
-      green_context->context_));
-  }
-  CUdeviceptr devPtr = reinterpret_cast<CUdeviceptr>(ptr);
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemUnmap_(
-    devPtr, paddedSize));
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemAddressFree_(
-    devPtr, paddedSize));
-  // Two releases: one to undo cuMemRetainAllocationHandle, one for the
-  // original cuMemCreate.
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemRelease_(handle));
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemRelease_(handle));
-  if (stream_ctx != green_context->green_ctx_) {
-    CUcontext popped;
-    C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuCtxPopCurrent_(&popped));
-    TORCH_INTERNAL_ASSERT(popped == green_context->context_,
-      "expected popped context to be the current green ctx");
-  }
-#endif
-}
-
-std::vector<std::unique_ptr<LocalizedGreenContextMemPool>>
-LocalizedGreenContextMemPool::create_node_pools(
-    std::vector<GreenContext*> const& green_contexts,
-    bool alloc_in_order) {
-#if HAS_CUDA_GREEN_CONTEXT_LOCALIZATION()
-  size_t first_idx = green_contexts.size();
-  for (size_t i = 0; i < green_contexts.size(); i++) {
-    TORCH_CHECK(green_contexts[i]->has_memory_node(),
-      "GreenContext localized MemPool requires localized green context.");
-    if (green_contexts[i]->memory_node_id() == 0) {
-      first_idx = i;
-      break;
-    }
-  }
+GreenContext::GreenContext(
+    uint32_t device_id,
+    std::optional<uint32_t> num_sms,
+    std::optional<int32_t> workqueue_scope,
+    std::optional<uint32_t> workqueue_concurrency_limit,
+    std::optional<int32_t> locality_domain_id) {
+#if HAS_CUDA_GREEN_CONTEXT()
   TORCH_CHECK(
-      first_idx < green_contexts.size(),
-      "create_node_pools requires a green context with memory_node_id 0");
-  auto first_pool = std::unique_ptr<LocalizedGreenContextMemPool>(
-    new LocalizedGreenContextMemPool(
-      green_contexts[first_idx], alloc_in_order, nullptr));
-  LocalizedGreenContextMemPool* first_pool_ptr = first_pool.get();
-  std::vector<std::unique_ptr<LocalizedGreenContextMemPool>> node_pools;
-  node_pools.reserve(green_contexts.size());
-  for (size_t i = 0; i < green_contexts.size(); i++) {
-    if (i == first_idx) {
-      node_pools.push_back(std::move(first_pool));
-    } else {
-      node_pools.push_back(std::unique_ptr<LocalizedGreenContextMemPool>(
-        new LocalizedGreenContextMemPool(
-          green_contexts[i], alloc_in_order, first_pool_ptr)));
-    }
+      num_sms.has_value() || workqueue_scope.has_value() || locality_domain_id.has_value(),
+      "At least one of num_sms or workqueue_scope or locality_domain_id must be specified");
+  TORCH_CHECK(
+      !locality_domain_id.has_value() || !num_sms.has_value(),
+      "locality_domain_id and num_sms cannot be specified together");
+  TORCH_CHECK(
+      !workqueue_concurrency_limit.has_value() || workqueue_scope.has_value(),
+      "workqueue_concurrency_limit requires workqueue_scope to be set");
+
+  CUcontext pctx = nullptr;
+  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuCtxGetCurrent_(&pctx));
+  if (C10_UNLIKELY(!pctx)) {
+    TORCH_WARN(
+        "Attempted to create a green context but"
+        " there was no primary context! Creating a primary context...");
+
+    C10_CUDA_CHECK(cudaFree(nullptr));
   }
-  return node_pools;
-#else
-  TORCH_CHECK(false, "Green Context localization is only supported on CUDA 13.4+!");
-#endif
-}
 
-LocalizedGreenContextMemPool::LocalizedGreenContextMemPool(
-    GreenContext* green_context,
-    bool alloc_in_order,
-    LocalizedGreenContextMemPool* first_pool)
-    : LocalizedGreenContextAllocatorHolder{
-          std::make_shared<LocalizedGreenContextAllocator>(green_context)},
-#if HAS_CUDA_GREEN_CONTEXT_LOCALIZATION()
-      MemPool(allocator, /*is_user_created=*/true, /*use_on_oom=*/false,
-        /*no_split=*/false,
-        /*on_begin_allocate=*/
-        [this](int device) {
-          TORCH_CHECK(
-            green_context_->device_id() == device,
-            "GreenContext MemPool device mismatch. MemPool device: ",
-            device,
-            ", GreenContext device: ",
-            green_context_->device_id());
-          if (is_alloc_in_order()) {
-            if (green_context_->memory_node_id() == 0) {
-              first_pool_->main_event_.record(c10::cuda::getCurrentCUDAStream());
-            }
-            green_context_->setContext(/*block_current_stream=*/false);
-            first_pool_->main_event_.block(c10::cuda::getCurrentCUDAStream());
-          } else {
-            green_context_->setContext(/*block_current_stream=*/true);
-          }
-        },
-        /*on_end_allocate=*/
-        [this](int device) {
-          TORCH_CHECK(
-            green_context_->device_id() == device,
-            "GreenContext MemPool device mismatch. MemPool device: ",
-            device,
-            ", GreenContext device: ",
-            green_context_->device_id());
-          if (is_alloc_in_order()) {
-            first_pool_->node_events_[green_context_->memory_node_id()].record(
-              c10::cuda::getCurrentCUDAStream());
-            green_context_->popContext(/*block_parent_stream=*/false);
-            auto last_id =
-                first_pool_->green_context()->num_memory_nodes() - 1;
-            if (green_context_->memory_node_id() == last_id) {
-              for (auto& node_event : first_pool_->node_events_) {
-                node_event.block(c10::cuda::getCurrentCUDAStream());
-              }
-            }
-          } else {
-            green_context_->popContext(/*block_parent_stream=*/true);
-          }
-        }),
-#else
-      MemPool(),
-#endif
-      green_context_(green_context),
-      alloc_in_order_(alloc_in_order),
-      main_event_(),
-      node_events_(),
-      first_pool_(first_pool == nullptr ? this : first_pool) {
-#if HAS_CUDA_GREEN_CONTEXT_LOCALIZATION()
-  TORCH_CHECK(green_context_, "GreenContext MemPool requires a context.");
-  TORCH_CHECK(green_context->has_memory_node(),
-    "GreenContext localized MemPool requires localized green context.");
-  if (green_context->num_memory_nodes() <= 1) {
-    TORCH_WARN_ONCE("GreenContext localized MemPool used with single memory node.");
-  }
-  if (first_pool_ == this) {
-    node_events_.resize(green_context->num_memory_nodes());
-  }
-#endif
-}
-
-GreenContext* LocalizedGreenContextMemPool::green_context() const {
-#if HAS_CUDA_GREEN_CONTEXT_LOCALIZATION()
-  return green_context_;
-#else
-  TORCH_CHECK(false, "Green Context localization is only supported on CUDA 13.4+!");
-  return nullptr;
-#endif
-}
-
-bool LocalizedGreenContextMemPool::is_alloc_in_order() const {
-#if HAS_CUDA_GREEN_CONTEXT_LOCALIZATION()
-  return alloc_in_order_;
-#else
-  TORCH_CHECK(false, "Green Context localization is only supported on CUDA 13.4+!");
-  return false;
-#endif
-}
-
-void LocalizedGreenContextMemPool::set_alloc_in_order(bool alloc_in_order) {
-#if HAS_CUDA_GREEN_CONTEXT_LOCALIZATION()
-  alloc_in_order_ = alloc_in_order;
-#else
-  TORCH_CHECK(false, "Green Context localization is only supported on CUDA 13.4+!");
-#endif
-}
-
-// ---------------------------------------------------------------------------
-// LocalizedAllocator (NativeAllocatorBackend for localized / uGPU allocation)
-// ---------------------------------------------------------------------------
-// Always used through NativeAllocatorBackendWrapper, which owns the deleter
-// dispatch via its PtrMetadata map.  LocalizedAllocator::get_deleter() should
-// never be called by the caching allocator (the wrapper's get_deleter() is
-// used instead).
-
-void* LocalizedAllocator::allocate(
-    size_t size,
-    c10::DeviceIndex device,
-    cudaStream_t stream) {
-#if HAS_CUDA_GREEN_CONTEXT_LOCALIZATION()
-  int driver_version = 0;
-  C10_CUDA_CHECK(cudaDriverGetVersion(&driver_version));
-  TORCH_CHECK(driver_version >= 13040, "cuda driver too old to use localized allocator!");
-
-  CUdevice dev;
+  CUdevice device;
+  device_id_ = device_id;
   C10_CUDA_DRIVER_CHECK(
-      c10::cuda::DriverAPI::get()->cuDeviceGet_(&dev, device));
-  int count = 0;
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuDeviceGetAttribute_(
-    &count, CU_DEVICE_ATTRIBUTE_MEMORY_NODE_COUNT, dev));
-  TORCH_CHECK(count > 0 && count <= 2,
-    "Currently the localized allocator only supports 2 memory nodes.");
-  TORCH_CHECK(size % count == 0, "Size ", size,
-    " must be a multiple of the number of memory nodes: ", count);
+      c10::cuda::DriverAPI::get()->cuDeviceGet_(&device, device_id));
 
-  TORCH_INTERNAL_ASSERT(count > 0 && count <= MAX_MEMORY_NODES,
-    "Invalid number of memory nodes: ", count);
+  std::vector<CUdevResource> resources;
 
-  // Create the memory allocation on uGPU0 and uGPU1 (two halves).
-  CUmemAllocationProp prop = {};
-  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-  prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE_MEMORY_NODE;
-  prop.location.localized.deviceId = device;
-  prop.location.localized.memoryNodeId = 0;
-  size_t granularity = 1;
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemGetAllocationGranularity_(
-    &granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
-  for (int i = 1; i < count; i++) {
-    prop.location.localized.memoryNodeId = i;
-    size_t granularity_i = 1;
-    C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemGetAllocationGranularity_(
-      &granularity_i, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
-    TORCH_INTERNAL_ASSERT(granularity_i == granularity,
-      "granularity must be the same for all memory nodes");
+  // --- SM resource ---
+  if (num_sms.has_value()) {
+    CUdevResource sm_resource;
+    C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuDeviceGetDevResource_(
+        device, &sm_resource, CU_DEV_RESOURCE_TYPE_SM));
+
+    TORCH_CHECK(
+        *num_sms > 0 && *num_sms <= sm_resource.sm.smCount,
+        "Invalid number of SMs requested for green context: ",
+        *num_sms,
+        " (device has ",
+        sm_resource.sm.smCount,
+        " SMs)");
+
+    // Split resources
+    std::vector<CUdevResource> split_result(1);
+    unsigned int nb_groups = 1;
+    CUdevResource remaining;
+
+    C10_CUDA_DRIVER_CHECK(
+        c10::cuda::DriverAPI::get()->cuDevSmResourceSplitByCount_(
+            split_result.data(),
+            &nb_groups,
+            &sm_resource,
+            &remaining,
+            0, // default flags
+            *num_sms));
+    TORCH_CHECK(nb_groups == 1, "Failed to create single SM resource group");
+    resources.push_back(split_result[0]);
   }
 
-  // Each cuMemCreateLocalized size must be a multiple of granularity (driver API
-  // requirement). So round each node's memory up to granularity.
-  // in order to guarantee support for any C++ data type, we first ensure that
-  // the node size is a multiple of 16 bytes.
-  TORCH_INTERNAL_ASSERT(granularity % MIN_ALIGNMENT == 0,
-    "granularity must be a multiple of MIN_ALIGN");
-  size_t nodeSize = size / count;
-  nodeSize = (nodeSize + MIN_ALIGNMENT - 1) & ~(MIN_ALIGNMENT - 1);
-  size_t nodePaddedSize = (nodeSize + (granularity - 1)) & ~(granularity - 1);
-  size_t paddedSize = nodePaddedSize * count;
-  TORCH_INTERNAL_ASSERT(nodePaddedSize >= nodeSize,
-    "nodePaddedSize must be greater or equal to nodeSize");
+  // --- Workqueue config resource ---
+  if (workqueue_scope.has_value()) {
+#if HAS_CUDA_WORKQUEUE_SUPPORT()
+    CUdevResource wq_resource{};
+    C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuDeviceGetDevResource_(
+        device, &wq_resource, CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG));
 
-  PtrMetadata metadata{};
-  metadata.allocator = this;
-  metadata.nodePaddedSize = nodePaddedSize;
-  metadata.nodeSize = nodeSize;
-  metadata.memoryNodeCount = count;
-
-  for (int i = 0; i < count; i++) {
-    prop.location.localized.memoryNodeId = i;
-    C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemCreate_(
-      &metadata.handles[i],
-      nodePaddedSize,
-      &prop,
-      /*flags*/0));
-  }
-
-  CUdeviceptr devPtr;
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemAddressReserve_(
-    &devPtr, paddedSize, granularity, /*addr hint*/0, /*flags*/0));
-  // cuMemMap requires ptr and size to be multiples of allocation granularity.
-  // Thus, we will center any allocation around the granularity boundary.
-  // Note that this does not work in case we have more than 2 memory nodes.
-  for (int i = 0; i < count; i++) {
-    C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemMap_(
-      devPtr + i * nodePaddedSize, nodePaddedSize, /*offset*/0, metadata.handles[i], /*flags*/0));
-  }
-
-  CUmemAccessDesc desc = {};
-  desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-  desc.location.id = device;
-  desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemSetAccess_(
-    devPtr, paddedSize, &desc, /*count [#descriptors]*/1));
-
-  // here we center the output pointer around the granularity boundary.
-  auto* ptr = reinterpret_cast<void*>(devPtr + (nodePaddedSize - nodeSize));
-  {
-    std::lock_guard<std::mutex> lock(ptr_mutex_());
-    ptr_to_metadata_()[ptr] = metadata;
-  }
-
-  return ptr;
+    wq_resource.wqConfig.sharingScope =
+        static_cast<CUdevWorkqueueConfigScope>(*workqueue_scope);
+    if (workqueue_concurrency_limit.has_value()) {
+      wq_resource.wqConfig.wqConcurrencyLimit = *workqueue_concurrency_limit;
+    }
+    resources.push_back(wq_resource);
 #else
-  TORCH_CHECK(false, "Green Context localization is only supported on CUDA 13.4+!");
-  return nullptr;
+    TORCH_CHECK(
+        false,
+        "Workqueue configuration for green contexts requires CUDA 13.1+!");
+#endif
+  }
+
+  if (locality_domain_id.has_value()) {
+#if HAS_CUDA_GREEN_CONTEXT_LOCALIZATION()
+    // cache the localized SM resources for the locality domains, per device id
+    static std::unordered_map<uint32_t, std::vector<CUdevResource>> localizedSms;
+    if (localizedSms.find(device_id) == localizedSms.end()) {
+      // first get normal SM resource
+      CUdevResource sm_resource;
+      C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuDeviceGetDevResource_(
+          device, &sm_resource, CU_DEV_RESOURCE_TYPE_SM));
+
+      // get the number of locality domains
+      int count = 0;
+      C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuDeviceGetAttribute_(
+        &count, CU_DEVICE_ATTRIBUTE_MEMORY_NODE_COUNT, device));
+      TORCH_CHECK(count > 0, "No locality domains found on device!");
+      auto& deviceLocalizedSms = localizedSms[device_id];
+      deviceLocalizedSms.resize(count);
+
+      // TODO: in the future, we might want to support custom coscheduled SM count
+      // and remainder resource
+
+      // set up params for resource splitting
+      std::vector<CU_DEV_SM_RESOURCE_GROUP_PARAMS> params(count);
+      for (int i = 0; i < count; i++) {
+        std::memset(params.data() + i, 0, sizeof(params[i]));
+        params[i].smCount = 0; // Use discovery mode of the API to derive SM count
+        params[i].coscheduledSmCount = 2; // The minimum cluster capability: 2 SMs
+        params[i].flags = CU_DEV_SM_RESOURCE_GROUP_MEMORY_NODE_ID;
+        params[i].memoryNodeId = static_cast<unsigned char>(i);
+      }
+      // split the SM resource into the locality domains
+      C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuDevSmResourceSplit_(
+        deviceLocalizedSms.data(), count, &sm_resource, /*remainder resource*/nullptr, /*flags*/0, params.data()));
+    }
+    auto const& deviceLocalizedSms = localizedSms[device_id];
+    auto count = static_cast<int32_t>(deviceLocalizedSms.size());
+    TORCH_CHECK(
+        locality_domain_id.value() >= 0 && locality_domain_id.value() < count,
+        "Invalid locality domain ID!");
+    resources.push_back(deviceLocalizedSms[locality_domain_id.value()]);
+    locality_domain_id_ = locality_domain_id.value();
+    num_locality_domains_ = count;
+#else
+    TORCH_CHECK(
+        false, "Green Context localization is only supported on CUDA 13.4+!");
+#endif
+  }
+
+  // Generate resource descriptor
+  CUdevResourceDesc desc;
+  C10_CUDA_DRIVER_CHECK(
+      c10::cuda::DriverAPI::get()->cuDevResourceGenerateDesc_(
+          &desc,
+          resources.data(),
+          static_cast<unsigned int>(resources.size())));
+
+  // Create green context
+  // CU_GREEN_CTX_DEFAULT_STREAM is required per docs:
+  // https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__GREEN__CONTEXTS.html
+  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuGreenCtxCreate_(
+      &green_ctx_, desc, device, CU_GREEN_CTX_DEFAULT_STREAM));
+
+  // Convert to regular context
+  C10_CUDA_DRIVER_CHECK(
+      c10::cuda::DriverAPI::get()->cuCtxFromGreenCtx_(&context_, green_ctx_));
+  TORCH_CHECK(context_, "Green ctx conversion to regular ctx failed!");
+#else
+  TORCH_CHECK(false, "Green Context is only supported on CUDA 12.8+!");
 #endif
 }
 
-void LocalizedAllocator::free(void* ptr) {
-#if HAS_CUDA_GREEN_CONTEXT_LOCALIZATION()
-  PtrMetadata metadata;
-  bool found = false;
-  {
-    std::lock_guard<std::mutex> lock(ptr_mutex_());
-    auto it = ptr_to_metadata_().find(ptr);
-    if (it != ptr_to_metadata_().end()) {
-      metadata = it->second;
-      ptr_to_metadata_().erase(it);
-      found = true;
+// Implement move operations
+#if HAS_CUDA_GREEN_CONTEXT()
+GreenContext::GreenContext(GreenContext&& other) noexcept
+    : device_id_(std::exchange(other.device_id_, -1)),
+      locality_domain_id_(std::exchange(other.locality_domain_id_, -1)),
+      num_locality_domains_(std::exchange(other.num_locality_domains_, 0)),
+      green_ctx_(std::exchange(other.green_ctx_, nullptr)),
+      context_(std::exchange(other.context_, nullptr)),
+      parent_stream_(std::exchange(other.parent_stream_, nullptr)) {
+  curr_stream_idx_.exchange(other.curr_stream_idx_);
+  std::swap(this->green_ctx_streams_, other.green_ctx_streams_);
+}
+#else
+GreenContext::GreenContext(GreenContext&& other) noexcept {
+  TORCH_CHECK(false, "Green Context move constructor is only supported on CUDA 12.8+!");
+}
+#endif
+
+void GreenContext::destroy_resources() noexcept {
+#if HAS_CUDA_GREEN_CONTEXT()
+  // avoid throwing exceptions on destruction
+  // note: if curr_stream_idx_ was never updated, loop doesn't run
+  for (int i = std::min(curr_stream_idx_.load(), kStreamPerGreenContextPool - 1); i >= 0;
+       i--) {
+    if (!green_ctx_streams_[i]) continue;
+    auto err = c10::cuda::DriverAPI::get()->cuStreamDestroy_(green_ctx_streams_[i]);
+    if (err != CUDA_SUCCESS) {
+      TORCH_WARN(
+          "Failed to destroy green context side stream ",
+          i,
+          " with error code ",
+          static_cast<int>(err));
     }
   }
-  if (!found) return;
-  free_(ptr, metadata);
-#else
-  TORCH_CHECK(false, "Green Context localization is only supported on CUDA 13.4+!");
-#endif
-}
-
-void LocalizedAllocator::free_(void* ptr, PtrMetadata const& metadata) {
-#if HAS_CUDA_GREEN_CONTEXT_LOCALIZATION()
-  CUdeviceptr devPtr = reinterpret_cast<CUdeviceptr>(ptr) -
-    (metadata.nodePaddedSize - metadata.nodeSize);
-  for (int i = 0; i < metadata.memoryNodeCount; i++) {
-    C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemUnmap_(
-      devPtr + i * metadata.nodePaddedSize, metadata.nodePaddedSize));
-  }
-  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemAddressFree_(
-    devPtr, metadata.nodePaddedSize * metadata.memoryNodeCount));
-  for (int i = 0; i < metadata.memoryNodeCount; i++) {
-    C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemRelease_(metadata.handles[i]));
-  }
-#endif
-}
-
-void LocalizedAllocator::static_deleter(void* ptr) {
-#if HAS_CUDA_GREEN_CONTEXT_LOCALIZATION()
-  LocalizedAllocator::PtrMetadata metadata;
-  bool found = false;
-  {
-    std::lock_guard<std::mutex> lock(LocalizedAllocator::ptr_mutex_());
-    auto it = LocalizedAllocator::ptr_to_metadata_().find(ptr);
-    if (it != LocalizedAllocator::ptr_to_metadata_().end()) {
-      metadata = it->second;
-      LocalizedAllocator::ptr_to_metadata_().erase(it);
-      found = true;
+  if (green_ctx_) {
+    auto err = c10::cuda::DriverAPI::get()->cuGreenCtxDestroy_(green_ctx_);
+    if (err != CUDA_SUCCESS) {
+      TORCH_WARN(
+          "Failed to destroy green context with error code ",
+          static_cast<int>(err));
     }
   }
-  if (found && metadata.allocator) {
-    metadata.allocator->free_(ptr, metadata);
+#endif
+}
+
+GreenContext& GreenContext::operator=(GreenContext&& other) noexcept {
+#if HAS_CUDA_GREEN_CONTEXT()
+  if (this != &other) {
+    // Clean up current resources
+    if (green_ctx_) {
+      CUcontext current = nullptr;
+      C10_CUDA_DRIVER_CHECK(
+          c10::cuda::DriverAPI::get()->cuCtxGetCurrent_(&current));
+      if (current == context_) {
+        TORCH_CHECK(
+            false,
+            "attempting to overwrite current green ctx "
+            "when it is active!");
+      }
+      destroy_resources();
+    }
+
+    // Take ownership of other's resources
+    device_id_ = std::exchange(other.device_id_, -1);
+    locality_domain_id_ = std::exchange(other.locality_domain_id_, -1);
+    num_locality_domains_ = std::exchange(other.num_locality_domains_, 0);
+    green_ctx_ = std::exchange(other.green_ctx_, nullptr);
+    context_ = std::exchange(other.context_, nullptr);
+    parent_stream_ = std::exchange(other.parent_stream_, nullptr);
+    curr_stream_idx_.exchange(other.curr_stream_idx_);
+    std::swap(this->green_ctx_streams_, other.green_ctx_streams_);
   }
-#endif
-}
-
-c10::DeleterFnPtr LocalizedAllocator::get_deleter() const {
-#if HAS_CUDA_GREEN_CONTEXT_LOCALIZATION()
-  return &static_deleter;
+  return *this;
 #else
-  TORCH_CHECK(false, "Green Context localization is only supported on CUDA 13.4+!");
-  return nullptr;
-#endif
-}
-
-std::string LocalizedAllocator::name() const {
-#if HAS_CUDA_GREEN_CONTEXT_LOCALIZATION()
-  return "localized";
-#else
-  TORCH_CHECK(false, "Green Context localization is only supported on CUDA 13.4+!");
-  return "";
+  TORCH_CHECK(false, "Green Context is only supported on CUDA 12.8+!");
+  return *this;
 #endif
 }
 
 } // namespace at::cuda
+
+#if HAS_CUDA_GREEN_CONTEXT() == 0
+C10_DIAGNOSTIC_POP_AND_IGNORED_IF_DEFINED()
+#endif

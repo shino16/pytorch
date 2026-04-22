@@ -51,6 +51,7 @@ set(C10_CUDA_HEADERS
     CUDAMathCompat.h
     CUDAMiscFunctions.h
     CUDAStream.h
+    NativeAllocatorBackend.h
     PeerToPeerAccess.h
     impl/CUDAGuardImpl.h
     impl/CUDATest.h

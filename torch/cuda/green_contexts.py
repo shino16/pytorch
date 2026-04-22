@@ -14,19 +14,18 @@ _LocalizedGreenContextMemPool = object
 _LocalizedAllocator = object
 SUPPORTED = False
 
-if (
-    hasattr(torch._C, "_CUDAGreenContext")
-    and hasattr(torch._C, "_CUDALocalizedGreenContextMemPool")
-    and hasattr(torch._C, "_CUDALocalizedAllocator")
-    and hasattr(torch._C, "_get_num_memory_nodes")
-):
+if hasattr(torch._C, "_CUDAGreenContext"):
     _GreenContext = torch._C._CUDAGreenContext  # type: ignore[misc]
-    _LocalizedGreenContextMemPool = torch._C._CUDALocalizedGreenContextMemPool  # type: ignore[misc]
-    _LocalizedAllocator = torch._C._CUDALocalizedAllocator  # type: ignore[misc]
     SUPPORTED = True
 
+if hasattr(torch._C, "_CUDALocalizedGreenContextMemPool"):
+    _LocalizedGreenContextMemPool = torch._C._CUDALocalizedGreenContextMemPool  # type: ignore[misc]
 
-def is_localization_supported(device_id: int) -> bool:
+if hasattr(torch._C, "_CUDALocalizedAllocator"):
+    _LocalizedAllocator = torch._C._CUDALocalizedAllocator  # type: ignore[misc]
+
+
+def is_localization_supported(device_id: int | None = None) -> bool:
     r"""Return a bool indicating if the current CUDA/ROCm device supports green context localization."""
     if not SUPPORTED:
         return False
@@ -38,7 +37,7 @@ def is_localization_supported(device_id: int) -> bool:
     if major < 13 or (major == 13 and minor < 4):
         return False
     # pyrefly: ignore [missing-attribute]
-    return torch._C._get_num_memory_nodes(device_id) > 1
+    return torch._C._get_num_locality_domains(device_id) > 1
 
 
 # Python shim helps Sphinx process docstrings more reliably.
@@ -51,29 +50,82 @@ class GreenContext(_GreenContext):
     """
 
     @staticmethod
-    def create(num_sms: int, device_id: int = 0) -> _GreenContext:
+    def create(
+        *,
+        num_sms: int | None = None,
+        workqueue_scope: str | None = None,
+        workqueue_concurrency_limit: int | None = None,
+        locality_domain_id: int | None = None,
+        device_id: int | None = None,
+    ) -> _GreenContext:
         r"""Create a CUDA green context.
 
+        At least one of ``workqueue_scope`` or ``num_sms``/``locality_domain_id``
+        must be specified, but ``num_sms`` and ``locality_domain_id`` cannot
+        be specified together.
+        If both ``workqueue_scope`` and ``num_sms``/``locality_domain_id`` are
+        provided, the green context will be created with a combination of
+        partitioning SMs and workqueues.
+
         Arguments:
-            num_sms (int): The number of SMs to use in the green context.
+            num_sms (int, optional): The number of SMs to use in the green
+                context. When ``None``, SMs are not partitioned.
+            workqueue_scope (str, optional): Workqueue sharing scope. One of
+                ``"device_ctx"`` (shared across all contexts, default driver
+                behaviour) or ``"balanced"`` (non-overlapping workqueues with
+                other balanced green contexts). When ``None``, no workqueue
+                configuration is applied.
+            workqueue_concurrency_limit (int, optional): Maximum number of
+                concurrent stream-ordered workloads for the workqueue. Requires
+                ``workqueue_scope`` to be set.
+            locality_domain_id (int, optional): The locality domain index to use for the green context.
+                When ``None``, the green context will be created for all locality domains.
             device_id (int, optional): The device index of green context.
+                When ``None``, the current device is used.
         """
         if not SUPPORTED:
             raise RuntimeError("PyTorch was not built with Green Context support!")
-        return _GreenContext.create(num_sms, device_id)  # type: ignore[attr-defined]
+        if locality_domain_id is not None and not is_localization_supported(device_id):
+            raise RuntimeError(
+                "Green Context localization is not supported on this device!"
+            )
+        return _GreenContext.create(  # type: ignore[attr-defined]
+            device_id=device_id,
+            num_sms=num_sms,
+            workqueue_scope=workqueue_scope,
+            workqueue_concurrency_limit=workqueue_concurrency_limit,
+            locality_domain_id=locality_domain_id,
+        )
 
     @staticmethod
-    def create_localized(device_id: int = 0) -> list[_GreenContext]:
-        r"""Create a CUDA green context for each memory node on the device.
+    def max_workqueue_concurrency(device_id: int | None = None) -> int:
+        r"""Return the maximum workqueue concurrency limit for the device.
+
+        This queries the device for the default number of concurrent
+        stream-ordered workloads supported by workqueue configuration
+        resources.
 
         Arguments:
-            device_id (int, optional): The device index of green context.
+            device_id (int, optional): The device index to query. When
+                ``None``, the current device is used.
         """
+        if not SUPPORTED:
+            raise RuntimeError("PyTorch was not built with Green Context support!")
+        return _GreenContext.max_workqueue_concurrency(device_id=device_id)  # type: ignore[attr-defined]
+
+    @staticmethod
+    def create_localized(device_id: int | None = None) -> list[_GreenContext]:
+        r"""Create a CUDA green context for each locality domain on the device."""
         if not is_localization_supported(device_id):
             raise RuntimeError(
                 "Green Context localization is not supported on this device!"
             )
-        return _GreenContext.create_localized(device_id)  # type: ignore[attr-defined]
+        # pyrefly: ignore [missing-attribute]
+        num_domains = torch._C._get_num_locality_domains(device_id)
+        return [
+            GreenContext.create(locality_domain_id=i, device_id=device_id)
+            for i in range(num_domains)
+        ]
 
     # Note that these functions are bypassed but we define them here
     # for Sphinx documentation purposes
@@ -97,6 +149,7 @@ class GreenContext(_GreenContext):
         r"""Assuming the green context is the current context, pop it from the
         context stack and restore the previous context.
 
+
         This blocks execution of the parent stream to wait for current operations on
         the green context's stream. The parent stream is the non-green context
         stream set before the green context was activated.
@@ -112,7 +165,7 @@ class GreenContext(_GreenContext):
         """
         return super().pop_context(block_parent_stream)  # type: ignore[misc]
 
-    def Stream(self) -> torch.Stream:
+    def Stream(self) -> "torch.cuda.Stream":
         r"""Return the CUDA Stream used by the green context."""
         return super().Stream()
 
@@ -145,23 +198,14 @@ def execute_in_green_contexts(
         return
 
     green_events = [torch.cuda.Event() for _ in green_contexts]
-    # first record an event in current stream, on which all green context
-    # streams need to wait
     main_event = torch.cuda.Event()
     main_event.record()
     for i, green_context in enumerate(green_contexts):
-        # the green context shouldn't block on current stream here,
-        # but it needs to block on the main stream event
         green_context.set_context(block_current_stream=False)
         main_event.wait()
-        # execute the function in the green context
         fn(i, green_context)
-        # record a separate event for each green context stream
         green_events[i].record()
-        # now pop the context without blocking
         green_context.pop_context(block_parent_stream=False)
 
-    # at this point, all functions were executed, and the main stream
-    # needs to block on all green context streams to "join" them
     for green_event in green_events:
         green_event.wait()
