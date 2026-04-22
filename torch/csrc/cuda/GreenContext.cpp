@@ -1,45 +1,75 @@
-#include <ATen/ATen.h>
 #include <ATen/cuda/CUDAGreenContext.h>
-#include <c10/cuda/CUDACachingAllocator.h>
 #include <torch/csrc/jit/python/pybind_utils.h>
-#include <torch/csrc/utils/device_lazy_init.h>
 #include <torch/csrc/utils/pybind.h>
-
-// Cargo culted partially from csrc/cuda/Stream.cpp
 
 void THCPGreenContext_init(PyObject* module) {
   auto m = py::handle(module).cast<py::module>();
-  m.def("_get_num_memory_nodes", &at::cuda::get_num_memory_nodes);
 
-  py::class_<
-      at::cuda::LocalizedAllocator,
-      c10::cuda::CUDACachingAllocator::NativeAllocatorBackend,
-      std::shared_ptr<at::cuda::LocalizedAllocator>>(
-      m, "_CUDALocalizedAllocator")
-      .def(py::init(
-          []() { return std::make_shared<at::cuda::LocalizedAllocator>(); }))
-      .def_readonly_static(
-          "min_alignment", &at::cuda::LocalizedAllocator::MIN_ALIGNMENT);
+  m.def(
+      "_get_num_locality_domains",
+      &at::cuda::get_num_locality_domains,
+      py::arg("device_id") = py::none());
+
+  py::enum_<at::cuda::WorkqueueScope>(m, "_WorkqueueScope")
+      .value("device_ctx", at::cuda::WorkqueueScope::DeviceCtx)
+      .value("balanced", at::cuda::WorkqueueScope::Balanced);
 
   py::class_<at::cuda::GreenContext>(m, "_CUDAGreenContext")
-      .def_static("create", &::at::cuda::GreenContext::create)
       .def_static(
-          "create_localized", &::at::cuda::GreenContext::create_localized)
+          "create",
+          [](std::optional<uint32_t> device_id,
+             std::optional<uint32_t> num_sms,
+             std::optional<std::string> workqueue_scope,
+             std::optional<uint32_t> workqueue_concurrency_limit,
+             std::optional<int32_t> locality_domain_id) {
+            std::optional<int32_t> scope;
+            if (workqueue_scope.has_value()) {
+              const auto& s = *workqueue_scope;
+              if (s == "device_ctx") {
+                scope =
+                    static_cast<int32_t>(at::cuda::WorkqueueScope::DeviceCtx);
+              } else if (s == "balanced") {
+                scope =
+                    static_cast<int32_t>(at::cuda::WorkqueueScope::Balanced);
+              } else {
+                throw std::invalid_argument(
+                    "workqueue_scope must be 'device_ctx' or 'balanced', got '" +
+                    s + "'");
+              }
+            }
+            return at::cuda::GreenContext::create(
+                device_id,
+                num_sms,
+                scope,
+                workqueue_concurrency_limit,
+                locality_domain_id);
+          },
+          py::kw_only(),
+          py::arg("device_id") = py::none(),
+          py::arg("num_sms") = py::none(),
+          py::arg("workqueue_scope") = py::none(),
+          py::arg("workqueue_concurrency_limit") = py::none(),
+          py::arg("locality_domain_id") = py::none())
+      .def_static(
+          "max_workqueue_concurrency",
+          &at::cuda::GreenContext::max_workqueue_concurrency,
+          py::arg("device_id") = py::none())
       .def_property_readonly("device_id", &::at::cuda::GreenContext::device_id)
       .def_property_readonly(
-          "memory_node_id", &::at::cuda::GreenContext::memory_node_id)
+          "locality_domain_id", &::at::cuda::GreenContext::locality_domain_id)
       .def_property_readonly(
-          "num_memory_nodes", &::at::cuda::GreenContext::num_memory_nodes)
+          "num_locality_domains",
+          &::at::cuda::GreenContext::num_locality_domains)
       .def_property_readonly(
-          "has_memory_node", &::at::cuda::GreenContext::has_memory_node)
+          "has_locality_domain", &::at::cuda::GreenContext::has_locality_domain)
       .def(
           "set_context",
           &::at::cuda::GreenContext::setContext,
-          py::arg("block_current_stream"))
+          py::arg("block_current_stream") = true)
       .def(
           "pop_context",
           &::at::cuda::GreenContext::popContext,
-          py::arg("block_parent_stream"))
+          py::arg("block_parent_stream") = true)
       .def("Stream", [](at::cuda::GreenContext& self) {
         auto s = self.Stream();
         cudaStream_t raw = s.stream();
@@ -50,41 +80,4 @@ void THCPGreenContext_init(PyObject* module) {
 
         return ExternalStream(ptr_val, py::int_(s.device_index()));
       });
-
-  using Pool = at::cuda::LocalizedGreenContextMemPool;
-  py::class_<Pool, std::shared_ptr<Pool>>(
-      m, "_CUDALocalizedGreenContextMemPool")
-      .def_static(
-          "create_node_pools",
-          [](py::list green_context_list, bool alloc_in_order) {
-            torch::utils::device_lazy_init(at::kCUDA);
-            std::vector<at::cuda::GreenContext*> ptrs;
-            for (auto& obj : green_context_list) {
-              ptrs.push_back(obj.cast<at::cuda::GreenContext*>());
-            }
-            auto pools = Pool::create_node_pools(ptrs, alloc_in_order);
-            // Pools hold raw GreenContext*; the contexts are owned by
-            // green_context_list. Each shared_ptr's custom deleter captures
-            // keepalive so the list outlives every pool (avoids use-after-free
-            // if the user keeps e.g. only pools[0] and drops the list).
-            py::object keepalive = green_context_list;
-            py::list result;
-            for (auto& p : pools) {
-              result.append(py::cast(std::shared_ptr<Pool>(
-                  p.release(), [keepalive](Pool* ptr) { delete ptr; })));
-            }
-            return result;
-          },
-          py::arg("green_contexts"),
-          py::arg("alloc_in_order") = false)
-      .def_property_readonly("id", &Pool::id)
-      .def_property(
-          "alloc_in_order", &Pool::is_alloc_in_order, &Pool::set_alloc_in_order)
-      .def("use_count", &Pool::use_count)
-      .def("call_on_begin_allocate", &Pool::call_on_begin_allocate)
-      .def("call_on_end_allocate", &Pool::call_on_end_allocate)
-      .def_property_readonly(
-          "green_context",
-          &Pool::green_context,
-          py::return_value_policy::reference);
 }

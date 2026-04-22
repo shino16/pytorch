@@ -611,6 +611,8 @@ if(USE_CUDA)
   if(NOT WIN32)
     set_source_files_properties(
       ${TORCH_ROOT}/aten/src/ATen/cuda/CUDAGreenContext.cpp
+      ${TORCH_ROOT}/aten/src/ATen/cuda/LocalizedGreenContextMemPool.cpp
+      ${TORCH_ROOT}/aten/src/ATen/cuda/LocalizedAllocator.cpp
       PROPERTIES COMPILE_FLAGS "-DPYTORCH_C10_DRIVER_API_SUPPORTED=1"
     )
   endif()

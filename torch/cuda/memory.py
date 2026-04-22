@@ -65,13 +65,13 @@ __all__ = [
     "get_allocator_backend",
     "get_native_allocator_backend",
     "LocalizedAllocator",
+    "LocalizedGreenContextMemPool",
     "NativeAllocatorBackendWrapper",
     "CustomNativeAllocator",
     "reset_native_allocator_backend_to_caching",
     "use_native_allocator_backend",
     "CUDAPluggableAllocator",
     "change_current_allocator",
-    "LocalizedGreenContextMemPool",
     "MemPool",
     "use_mem_pool",
 ]
@@ -90,6 +90,7 @@ if not hasattr(torch._C, "_NativeAllocatorBackend"):
     torch._C.__dict__["_NativeAllocatorBackend"] = _dummy_type(
         "_NativeAllocatorBackend"
     )
+
 
 if not hasattr(torch._C, "_MemPool"):
     # Define dummy base classes
@@ -113,7 +114,7 @@ from torch._C import (  # noqa: F401
     _cuda_releasePool,
     _MemPool,
     _NativeAllocatorBackend,
-    _NativeAllocatorBackendBase,  # pyrefly: ignore [missing-module-attribute]
+    _NativeAllocatorBackendBase,  # pyrefly: ignore[missing-module-attribute]
 )
 
 
@@ -1260,7 +1261,7 @@ class CustomNativeAllocator(NativeAllocatorBackendWrapper):
 
 
 class LocalizedAllocator(NativeAllocatorBackendWrapper):
-    r"""Wrapper around the C++ localized allocator backend (e.g. for uGPU memory-node allocation).
+    r"""Wrapper around the C++ localized allocator backend (e.g. for locality domain allocation).
 
     Use with :func:`use_native_allocator_backend` to route CUDA allocations through the
     localized allocator. Requires :func:`torch.cuda.green_contexts.is_localization_supported`
@@ -1278,9 +1279,9 @@ class LocalizedAllocator(NativeAllocatorBackendWrapper):
     @staticmethod
     def split(t: torch.Tensor) -> tuple[torch.Tensor, ...]:
         r"""Split the given tensor into a list of tensor views,
-          each of which is allocated on a different memory node.
+          each of which is allocated on a different locality domain.
 
-        Note: currently only supports two memory nodes.
+        Note: currently only supports two locality domains.
         Note: if a clean split into contiguous chunks along the dimensions
         of `t` is not possible, then a list of flat views is returned.
         """
@@ -1288,7 +1289,7 @@ class LocalizedAllocator(NativeAllocatorBackendWrapper):
             raise RuntimeError(
                 "Localized allocator split is not supported with this PyTorch build!"
             )
-        align = _LocalizedAllocator.min_alignment  # pyrefly: ignore [missing-attribute]
+        align = _LocalizedAllocator.min_alignment  # pyrefly: ignore[missing-attribute]
         if align % t.element_size() != 0:
             raise ValueError(
                 f"Minimum alignment {align} is not "
@@ -1296,8 +1297,6 @@ class LocalizedAllocator(NativeAllocatorBackendWrapper):
                 "This is not supported by the localized allocator."
             )
         if t.numel() <= 1:
-            # since the minimum alignment is a multiple of element size,
-            # the second half must always be empty
             return (t, torch.empty(0, device=t.device, dtype=t.dtype))
 
         def round_up(x, y):
@@ -1310,13 +1309,10 @@ class LocalizedAllocator(NativeAllocatorBackendWrapper):
         flat_split = torch.tensor_split(tf, (split_idx,))
 
         for i in range(t.ndim):
-            # note: we cannot skip all dimensions here,
-            # because we have at least 2 elements in the tensor.
             if t.shape[i] == 1:
                 continue
             trailing_elems = t[(0,) * (i + 1)].numel()
             if split_idx % trailing_elems != 0:
-                # if this is not the case, we cannot cleanly split
                 break
             leading_dims = [1 for _ in range(i)]
             trailing_dims = list(t.shape[i + 1 :])
@@ -1324,7 +1320,6 @@ class LocalizedAllocator(NativeAllocatorBackendWrapper):
                 x.view(*(leading_dims + [-1] + trailing_dims)) for x in flat_split
             )
 
-        # cannot split cleanly into contiguous chunks: return flat views
         return flat_split
 
 
@@ -1353,9 +1348,7 @@ def use_native_allocator_backend(backend: NativeAllocatorBackendWrapper):
         ...     "/path/to/libmyalloc.so", "my_alloc", "my_free"
         ... )
         >>> with torch.cuda.memory.use_native_allocator_backend(backend):
-        ...     # allocations use the custom backend
         ...     x = torch.zeros(10, device="cuda")
-        >>> # back to built-in caching
     """
     backend.set_as_native_backend()
     try:
@@ -1490,14 +1483,14 @@ class MemPool(_MemPool):
 class LocalizedGreenContextMemPool(_LocalizedGreenContextMemPool, MemPool):
     r"""MemPool that routes allocations based on a localized GreenContext.
 
-    Instances are created only via :meth:`create_node_pools`, which takes a list
+    Instances are created only via :meth:`create_domain_pools`, which takes a list
     of :class:`GreenContext` (e.g. from :meth:`GreenContext.create_localized`).
     Each pool in the returned list corresponds to one entry in that list. The
     :attr:`green_context` property gives access to the underlying green context.
     """
 
     @staticmethod
-    def create_node_pools(
+    def create_domain_pools(
         green_contexts: list[GreenContext],
         alloc_in_order: bool = False,
     ) -> list["LocalizedGreenContextMemPool"]:
@@ -1506,11 +1499,11 @@ class LocalizedGreenContextMemPool(_LocalizedGreenContextMemPool, MemPool):
         Arguments:
             green_contexts (list[GreenContext]): List of green contexts, e.g. from
                 :meth:`GreenContext.create_localized`. Must include one context with
-                ``memory_node_id == 0``. The caller must keep this list alive for the
+                ``locality_domain_id == 0``. The caller must keep this list alive for the
                 lifetime of the returned pools.
             alloc_in_order (bool, optional): Assert that
                 :func:`use_mem_pool` will be entered in ascending
-                ``memory_node_id`` order, enabling lighter synchronization.
+                ``locality_domain_id`` order, enabling lighter synchronization.
                 Can be changed later via the :attr:`alloc_in_order` property.
                 Default is ``False``.
 
@@ -1523,7 +1516,7 @@ class LocalizedGreenContextMemPool(_LocalizedGreenContextMemPool, MemPool):
             raise RuntimeError(
                 "Green Context localization is not supported on this device!"
             )
-        return _LocalizedGreenContextMemPool.create_node_pools(  # type: ignore[attr-defined]
+        return _LocalizedGreenContextMemPool.create_domain_pools(  # type: ignore[attr-defined]
             green_contexts,
             alloc_in_order,
         )
@@ -1535,13 +1528,13 @@ class LocalizedGreenContextMemPool(_LocalizedGreenContextMemPool, MemPool):
 
     @property
     def alloc_in_order(self) -> bool:
-        r"""Whether the caller guarantees allocations are issued in memory-node order.
+        r"""Whether the caller guarantees allocations are issued in locality domain order.
 
         When ``True``, the pool uses lighter synchronization (a single event
-        broadcast from node 0 instead of per-pool stream blocking).  The caller
-        **must** ensure that :func:`use_mem_pool` is entered for each pool in
-        ascending ``memory_node_id`` order; violating this leads to undefined
-        behaviour.
+        broadcast from locality domain 0 instead of per-pool stream blocking).
+        The caller **must** ensure that :func:`use_mem_pool` is entered for each
+        pool in ascending ``locality_domain_id`` order; violating this leads to
+        undefined behaviour.
 
         Defaults to ``False``.
         """
@@ -1549,7 +1542,7 @@ class LocalizedGreenContextMemPool(_LocalizedGreenContextMemPool, MemPool):
 
     @alloc_in_order.setter
     def alloc_in_order(self, value: bool) -> None:
-        r"""Set whether allocations are issued in memory-node order.
+        r"""Set whether allocations are issued in locality domain order.
 
         See :attr:`alloc_in_order` for details.
 

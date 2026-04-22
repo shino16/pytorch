@@ -9,15 +9,7 @@
 #include <c10/util/UniqueVoidPtr.h>
 #include <pybind11/pytypes.h>
 #include <torch/csrc/utils/python_arg_parser.h>
-#include <mutex>
-#include <unordered_map>
 #include <unordered_set>
-
-#if defined(_WIN32) || defined(_WIN64)
-#include <windows.h>
-#else
-#include <dlfcn.h>
-#endif
 
 #if AT_CUDNN_ENABLED()
 
@@ -44,6 +36,7 @@
 #include <torch/csrc/Generator.h>
 #include <torch/csrc/cuda/CUDAPluggableAllocator.h>
 #include <torch/csrc/cuda/GdsFile.h>
+#include <torch/csrc/cuda/NativeAllocatorBackendWrapper.h>
 #include <torch/csrc/cuda/THCP.h>
 #include <torch/csrc/cuda/memory_snapshot.h>
 #include <torch/csrc/cuda/python_comm.h>
@@ -1257,147 +1250,6 @@ void addStorageDeleterFns(
   }
 }
 
-namespace torch::cuda {
-
-// Wrapper that owns state for a custom native allocator backend. Performs
-// dlopen to load alloc/free from a .so. Python owns this object; the native
-// allocator only holds a non-owning pointer via setNativeAllocatorBackend.
-class NativeAllocatorBackendWrapper
-    : public c10::cuda::CUDACachingAllocator::NativeAllocatorBackend {
- public:
-  using AllocFnType = void*(size_t, int, cudaStream_t);
-  using FreeFnType = void(void*, size_t, int, cudaStream_t);
-
-  struct PtrMetadata {
-    NativeAllocatorBackendWrapper* wrapper;
-    size_t size;
-    int device;
-    cudaStream_t stream;
-  };
-
-  NativeAllocatorBackendWrapper(
-      const std::string& path_to_so,
-      const std::string& alloc_fn_name,
-      const std::string& free_fn_name) {
-#if defined(_WIN32) || defined(_WIN64)
-    handle_ = LoadLibraryA(path_to_so.c_str());
-    TORCH_CHECK(handle_, "Could not load library: ", path_to_so);
-    void* alloc_sym =
-        (void*)GetProcAddress((HMODULE)handle_, alloc_fn_name.c_str());
-    void* free_sym =
-        (void*)GetProcAddress((HMODULE)handle_, free_fn_name.c_str());
-    TORCH_CHECK(alloc_sym, "Could not find symbol: ", alloc_fn_name);
-    TORCH_CHECK(free_sym, "Could not find symbol: ", free_fn_name);
-    alloc_fn_ = reinterpret_cast<AllocFnType*>(alloc_sym);
-    free_fn_ = reinterpret_cast<FreeFnType*>(free_sym);
-#else
-    handle_ = dlopen(path_to_so.c_str(), RTLD_LAZY);
-    TORCH_CHECK(
-        handle_, "Could not load library: ", path_to_so, ": ", dlerror());
-    void* alloc_sym = dlsym(handle_, alloc_fn_name.c_str());
-    void* free_sym = dlsym(handle_, free_fn_name.c_str());
-    TORCH_CHECK(
-        alloc_sym, "Could not find symbol: ", alloc_fn_name, ": ", dlerror());
-    TORCH_CHECK(
-        free_sym, "Could not find symbol: ", free_fn_name, ": ", dlerror());
-    alloc_fn_ = reinterpret_cast<AllocFnType*>(alloc_sym);
-    free_fn_ = reinterpret_cast<FreeFnType*>(free_sym);
-#endif
-  }
-
-  ~NativeAllocatorBackendWrapper() override {
-#if defined(_WIN32) || defined(_WIN64)
-    if (handle_) {
-      FreeLibrary((HMODULE)handle_);
-    }
-#else
-    if (handle_) {
-      dlclose(handle_);
-    }
-#endif
-  }
-
-  void* allocate(size_t size, c10::DeviceIndex device, cudaStream_t stream)
-      override {
-    void* ptr = alloc_fn_(size, static_cast<int>(device), stream);
-    if (ptr) {
-      std::lock_guard<std::mutex> lock(ptr_mutex_());
-      ptr_to_metadata_()[ptr] =
-          PtrMetadata{this, size, static_cast<int>(device), stream};
-    }
-    return ptr;
-  }
-
-  void free(void* ptr) override {
-    if (!ptr) {
-      return;
-    }
-    PtrMetadata meta;
-    bool found = false;
-    {
-      std::lock_guard<std::mutex> lock(ptr_mutex_());
-      auto it = ptr_to_metadata_().find(ptr);
-      if (it != ptr_to_metadata_().end()) {
-        meta = it->second;
-        ptr_to_metadata_().erase(it);
-        found = true;
-      }
-    }
-    if (found) {
-      free_fn_(ptr, meta.size, meta.device, meta.stream);
-    }
-  }
-
-  c10::DeleterFnPtr get_deleter() const override {
-    return &static_deleter;
-  }
-
-  std::string name() const override {
-    return "custom";
-  }
-
-  void set_as_native_backend() {
-    c10::cuda::CUDACachingAllocator::setNativeAllocatorBackend(this);
-  }
-
-  static void reset_to_caching() {
-    c10::cuda::CUDACachingAllocator::resetNativeAllocatorBackendToCaching();
-  }
-
- private:
-  static void static_deleter(void* ptr) {
-    PtrMetadata meta{};
-    bool found = false;
-    {
-      std::lock_guard<std::mutex> lock(ptr_mutex_());
-      auto it = ptr_to_metadata_().find(ptr);
-      if (it != ptr_to_metadata_().end()) {
-        meta = it->second;
-        ptr_to_metadata_().erase(it);
-        found = true;
-      }
-    }
-    if (found && meta.wrapper) {
-      meta.wrapper->free_fn_(ptr, meta.size, meta.device, meta.stream);
-    }
-  }
-
-  static std::mutex& ptr_mutex_() {
-    static std::mutex m;
-    return m;
-  }
-  static std::unordered_map<void*, PtrMetadata>& ptr_to_metadata_() {
-    static std::unordered_map<void*, PtrMetadata> map;
-    return map;
-  }
-
-  void* handle_ = nullptr;
-  AllocFnType* alloc_fn_ = nullptr;
-  FreeFnType* free_fn_ = nullptr;
-};
-
-} // namespace torch::cuda
-
 static void registerCudaPluggableAllocator(PyObject* module) {
   auto m = py::handle(module).cast<py::module>();
 
@@ -1516,42 +1368,7 @@ static void registerCudaPluggableAllocator(PyObject* module) {
         malloc_fn, free_fn);
   });
 
-  m.def("_cuda_getNativeAllocatorBackendName", []() {
-    return c10::cuda::CUDACachingAllocator::getNativeAllocatorBackendName();
-  });
-
-  m.def("_cuda_resetNativeAllocatorBackendToCaching", []() {
-    torch::cuda::NativeAllocatorBackendWrapper::reset_to_caching();
-  });
-
-  // Base class for all native allocator backends (exposed so both the .so
-  // wrapper and LocalizedAllocator share the same Python base type).
-  py::class_<
-      c10::cuda::CUDACachingAllocator::NativeAllocatorBackend,
-      std::shared_ptr<c10::cuda::CUDACachingAllocator::NativeAllocatorBackend>>(
-      m, "_NativeAllocatorBackendBase")
-      .def(
-          "set_as_native_backend",
-          [](c10::cuda::CUDACachingAllocator::NativeAllocatorBackend& self) {
-            c10::cuda::CUDACachingAllocator::setNativeAllocatorBackend(&self);
-          })
-      .def(
-          "reset_to_caching",
-          [](c10::cuda::CUDACachingAllocator::NativeAllocatorBackend&) {
-            c10::cuda::CUDACachingAllocator::
-                resetNativeAllocatorBackendToCaching();
-          });
-
-  // .so-based wrapper: loads alloc/free from a shared library.
-  py::class_<
-      torch::cuda::NativeAllocatorBackendWrapper,
-      std::shared_ptr<torch::cuda::NativeAllocatorBackendWrapper>,
-      c10::cuda::CUDACachingAllocator::NativeAllocatorBackend>(
-      m, "_NativeAllocatorBackend")
-      .def(py::init<
-           const std::string&,
-           const std::string&,
-           const std::string&>());
+  torch::cuda::register_cuda_native_allocator_backend_bindings(module);
 
   // NOLINTNEXTLINE(bugprone-unused-raii)
   py::class_<

@@ -6,7 +6,6 @@
 #include <functional>
 #include <memory>
 
-
 namespace at::cuda {
 
 // Keep BC only
@@ -42,7 +41,7 @@ struct TORCH_CUDA_CPP_API MemPool {
   c10::DeviceIndex device();
   static MempoolId_t graph_pool_handle(bool is_user_created = true);
 
-  /// Optional hooks invoked when entering/leaving the pool in use_mem_pool.
+  // Optional hooks invoked when entering/leaving the pool in use_mem_pool.
   void call_on_begin_allocate(int device_index);
   void call_on_end_allocate(int device_index);
 
