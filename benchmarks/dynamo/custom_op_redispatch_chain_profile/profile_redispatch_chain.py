@@ -1,4 +1,4 @@
-"""Pin down where Richard's redispatch-chain prototype loses ~5μs vs current PR.
+"""Pin down where zou3519's redispatch-chain prototype loses ~5μs vs current PR.
 
 Builds the no-grad path *up* from current-PR shape to full-richard shape, one
 piece at a time. Each delta = cost of that piece.
@@ -13,7 +13,7 @@ Variants (no-grad path body, after the shared C++ guard + device/fn lookup):
   v5_metadata           : + Metadata dataclass alloc
   v6_forward_no_grad    : + forward_no_grad Python frame
   v7_autograd_impl_sc   : + autograd_impl frame (TLS-shortcut: no predicate recompute)
-  v8_autograd_impl_full : + predicate recompute (== Richard's prototype)
+  v8_autograd_impl_full : + predicate recompute (== zou3519's prototype)
 
 Each entry shares the same prelude: torch.compiler.is_compiling, kwargs guard,
 _C._custom_op_fast_path_check, device/disabled/fn lookup. Differences are only
@@ -39,7 +39,7 @@ from torch._library import custom_ops as _custom_ops_mod
 from torch._library import utils as _lib_utils
 
 
-# --------- Richard's _enable_fast_dispatch (monkey-patch onto OpOverload) ---------
+# --------- zou3519's _enable_fast_dispatch (monkey-patch onto OpOverload) ---------
 _fast_dispatch_tls = threading.local()
 
 
