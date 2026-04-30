@@ -2520,6 +2520,28 @@ class TMACompatibilityChecker:
                         )
                         return False
                 else:
+                    # For stores whose innermost block is a non-reduction
+                    # (X/Y/Z) tile, raising tma_min_block_sizes eliminates
+                    # the small-XBLOCK reduction configs that are typically
+                    # the autotune winners (e.g. per-row mean / inv_std
+                    # stores in two-pass norm kernels). Fall back to a
+                    # scalar store instead — the X load TMA is preserved
+                    # and the autotune config space stays full-width.
+                    if (
+                        self.for_store
+                        and min_block_size > 1
+                        and innermost_block_symt
+                        not in TritonSymbols.reduction_types
+                    ):
+                        log.debug(
+                            "%s store with non-reduction innermost block %s "
+                            "would force tma_min_block_sizes >= %d; "
+                            "falling back to scalar store.",
+                            self.failed_debug_prefix,
+                            block_type_str,
+                            min_block_size,
+                        )
+                        return False
                     # Update the minimum block sizes that are passed to triton
                     # heuristics
                     self.kernel.tma_min_block_sizes[block_type_str] = max(
