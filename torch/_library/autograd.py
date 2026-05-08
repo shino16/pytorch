@@ -61,27 +61,33 @@ def make_autograd_impl(op: _ops.OpOverload, info: InfoProtocol) -> Callable:
         metadata = args[-1]
         args = args[:-1]
 
-        with _C._AutoDispatchBelowAutograd():
-            keyset = metadata.keyset
-            kwargs = metadata.keyword_only_args
+        keyset = metadata.keyset
+        kwargs = metadata.keyword_only_args
+        prev = _C._or_excluded_dispatch_keyset_raw(_C._autograd_dispatch_keyset_raw)
+        try:
             result = op.redispatch(keyset & _C._after_autograd_keyset, *args, **kwargs)
-            return result
+        finally:
+            _C._set_excluded_dispatch_keyset_raw(prev)
+        return result
 
     def forward(ctx, *args):
         metadata = args[-1]
         args = args[:-1]
 
-        with _C._AutoDispatchBelowAutograd():
-            keyset = metadata.keyset
-            kwargs = metadata.keyword_only_args
+        keyset = metadata.keyset
+        kwargs = metadata.keyword_only_args
+        prev = _C._or_excluded_dispatch_keyset_raw(_C._autograd_dispatch_keyset_raw)
+        try:
             result = op.redispatch(keyset & _C._after_autograd_keyset, *args, **kwargs)
-            # The Dispatcher strips args equal to their default values (done for
-            # serialization FC/BC). fill_defaults puts them back so setup_context
-            # sees the full call signature.
-            _invoke_setup_context(
-                info, op._schema, has_kwarg_only_args, ctx, args, kwargs, result
-            )
-            return result
+        finally:
+            _C._set_excluded_dispatch_keyset_raw(prev)
+        # The Dispatcher strips args equal to their default values (done for
+        # serialization FC/BC). fill_defaults puts them back so setup_context
+        # sees the full call signature.
+        _invoke_setup_context(
+            info, op._schema, has_kwarg_only_args, ctx, args, kwargs, result
+        )
+        return result
 
     def backward(ctx, *grads):
         if info._backward_fn:
