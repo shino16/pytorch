@@ -747,10 +747,15 @@ class CustomOpDef:
         has_kwarg_only_args = utils.has_kwarg_only_args(schema)
 
         def forward(ctx, *args):
-            with _C._AutoDispatchBelowAutograd():
+            prev = _C._or_excluded_dispatch_keyset_raw(
+                _C._autograd_dispatch_keyset_raw
+            )
+            try:
                 device_type = args[0].device.type
                 fn = raw_fns.get(device_type) or raw_fns.get(None)
                 result = fn(*args)  # pyrefly: ignore[not-callable]
+            finally:
+                _C._set_excluded_dispatch_keyset_raw(prev)
 
             utils._c_check_aliasing_constraint(op_name, args, {}, result)
             autograd._invoke_setup_context(
