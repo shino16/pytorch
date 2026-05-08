@@ -35,40 +35,54 @@ def make_autograd_impl(op: _ops.OpOverload, info: InfoProtocol) -> Callable:
         metadata = args[-1]
         args = args[:-1]
 
-        with _C._AutoDispatchBelowAutograd():
-            keyset = metadata.keyset
-            kwargs = metadata.keyword_only_args
-            result = op.redispatch(keyset & _C._after_autograd_keyset, *args, **kwargs)
-            return result
+        keyset = metadata.keyset
+        kwargs = metadata.keyword_only_args
+        prev = _C._or_excluded_dispatch_keyset_raw(_C._autograd_dispatch_keyset_raw)
+        try:
+            result = op.redispatch(
+                _C._dispatch_keyset_and_raw(keyset, _C._after_autograd_keyset_raw),
+                *args,
+                **kwargs,
+            )
+        finally:
+            _C._set_excluded_dispatch_keyset_raw(prev)
+        return result
 
     def forward(ctx, *args):
         metadata = args[-1]
         args = args[:-1]
 
-        with _C._AutoDispatchBelowAutograd():
-            keyset = metadata.keyset
-            kwargs = metadata.keyword_only_args
-            result = op.redispatch(keyset & _C._after_autograd_keyset, *args, **kwargs)
-            if info._setup_context_fn:
-                # The Dispatcher will remove args that are equal to their default
-                # values from (args, kwargs). We're going to add it back so that
-                # the user can access them.
-                #
-                # This is OK to do: The Dispatcher removed the args for serialization
-                # FC/BC reasons (that is, a graph will not store args that are equal
-                # to their default values), but that doesn't matter here. If the user
-                # adds a new default arg, then they must update
-                # their setup_context (along with the rest of their operator
-                # registrations)
-                args, kwargs = utils.fill_defaults(op._schema, args, kwargs)
+        keyset = metadata.keyset
+        kwargs = metadata.keyword_only_args
+        prev = _C._or_excluded_dispatch_keyset_raw(_C._autograd_dispatch_keyset_raw)
+        try:
+            result = op.redispatch(
+                _C._dispatch_keyset_and_raw(keyset, _C._after_autograd_keyset_raw),
+                *args,
+                **kwargs,
+            )
+        finally:
+            _C._set_excluded_dispatch_keyset_raw(prev)
+        if info._setup_context_fn:
+            # The Dispatcher will remove args that are equal to their default
+            # values from (args, kwargs). We're going to add it back so that
+            # the user can access them.
+            #
+            # This is OK to do: The Dispatcher removed the args for serialization
+            # FC/BC reasons (that is, a graph will not store args that are equal
+            # to their default values), but that doesn't matter here. If the user
+            # adds a new default arg, then they must update
+            # their setup_context (along with the rest of their operator
+            # registrations)
+            args, kwargs = utils.fill_defaults(op._schema, args, kwargs)
 
-                if has_kwarg_only_args:
-                    info._setup_context_fn(
-                        ctx=ctx, inputs=args, keyword_only_inputs=kwargs, output=result
-                    )
-                else:
-                    info._setup_context_fn(ctx=ctx, inputs=args, output=result)
-            return result
+            if has_kwarg_only_args:
+                info._setup_context_fn(
+                    ctx=ctx, inputs=args, keyword_only_inputs=kwargs, output=result
+                )
+            else:
+                info._setup_context_fn(ctx=ctx, inputs=args, output=result)
+        return result
 
     def backward(ctx, *grads):
         if info._backward_fn:

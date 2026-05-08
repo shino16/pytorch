@@ -847,6 +847,30 @@ void initDispatchBindings(PyObject* module) {
   m.def("_dispatch_tls_local_exclude_set", []() {
     return c10::impl::tls_local_dispatch_key_set().excluded_;
   });
+
+  // Fused TLS keyset helpers for fast custom-op dispatch.
+  // OR autograd keys into the excluded set; return previous raw value for restore.
+  // Safe because autograd_dispatch_keyset has no overlap with default_excluded_set.
+  m.def("_or_excluded_dispatch_keyset_raw", [](uint64_t ks_raw) -> uint64_t {
+    auto& raw_tls = c10::impl::raw_local_dispatch_key_set;
+    uint64_t prev_raw = raw_tls.excluded_;
+    raw_tls.excluded_ = prev_raw | ks_raw;
+    return prev_raw;
+  });
+  m.def("_set_excluded_dispatch_keyset_raw", [](uint64_t prev_raw) {
+    c10::impl::raw_local_dispatch_key_set.excluded_ = prev_raw;
+  });
+  m.def(
+      "_dispatch_keyset_and_raw",
+      [](c10::DispatchKeySet ks, uint64_t mask) {
+        return c10::DispatchKeySet(
+            c10::DispatchKeySet::RAW, ks.raw_repr() & mask);
+      });
+  m.attr("_autograd_dispatch_keyset_raw") =
+      c10::autograd_dispatch_keyset.raw_repr();
+  m.attr("_after_autograd_keyset_raw") =
+      c10::after_autograd_keyset.raw_repr();
+
   m.def("_functionalization_reapply_views_tls", []() {
     return at::functionalization::impl::getFunctionalizationReapplyViewsTLS();
   });
