@@ -16,6 +16,7 @@
 #include <ATen/core/enum_tag.h>
 
 #include <array>
+#include <atomic>
 #include <list>
 #include <optional>
 
@@ -94,6 +95,10 @@ class TORCH_API OperatorEntry final {
 
   bool isObserved() const {
     return is_observed_;
+  }
+
+  uint64_t implGeneration() const {
+    return impl_generation_.load(std::memory_order_relaxed);
   }
 
   // We may allocate an OperatorEntry for an operator even when we don't
@@ -300,6 +305,12 @@ class TORCH_API OperatorEntry final {
 
   // A Python custom error handler for OperatorEntry::reportError
   std::unique_ptr<c10::SafePyObject> report_error_callback_;
+
+  // Incremented each time a kernel is registered or deregistered for this
+  // operator. Used by the custom_op fast path to detect external overrides:
+  // the fast path snapshots this value at install time and bails out if it
+  // changes.
+  std::atomic<uint64_t> impl_generation_{0};
 
   // Whether this operator needs to be observed with RecordFunction
   const bool is_observed_;

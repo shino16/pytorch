@@ -933,7 +933,22 @@ class CustomOpDef:
         if not hasattr(overload, "_orig_op"):
             overload._orig_op = overload._op  # pyrefly: ignore[missing-attribute]
 
+        qualified_name = str(self._opoverload.name())
+        impl_gen_snapshot = [None]  # lazily captured on first call
+        fast_path_disabled = False
+
         def fast_op(*args, **kwargs):
+            nonlocal fast_path_disabled
+            if fast_path_disabled:
+                return overload._orig_op(*args, **kwargs)  # pyrefly: ignore[missing-attribute]
+
+            gen = _C._op_impl_generation(qualified_name)  # pyrefly: ignore[missing-attribute]
+            if impl_gen_snapshot[0] is None:
+                impl_gen_snapshot[0] = gen
+            elif gen != impl_gen_snapshot[0]:
+                fast_path_disabled = True
+                return overload._orig_op(*args, **kwargs)  # pyrefly: ignore[missing-attribute]
+
             info = _check_fast_path(args, kwargs)
             if info is not None:
                 device_type, keyset_raw, backend_impl = info

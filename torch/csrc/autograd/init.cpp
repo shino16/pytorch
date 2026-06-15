@@ -5,6 +5,7 @@
 #include <ATen/SequenceNumber.h>
 #include <ATen/autocast_mode.h>
 #include <ATen/core/PythonFallbackKernel.h>
+#include <ATen/core/dispatch/Dispatcher.h>
 #include <ATen/record_function.h>
 #include <c10/core/DeviceType.h>
 #include <c10/core/InferenceMode.h>
@@ -1360,6 +1361,35 @@ static PyObject* custom_op_fast_path_check(
   END_HANDLE_TH_ERRORS
 }
 
+// Returns the impl_generation counter for a given operator.
+// Arg: qualified operator name as str, e.g. "mylib::foo" or "mylib::foo.default"
+static PyObject* op_impl_generation(
+    PyObject* _unused,
+    PyObject* py_name) {
+  HANDLE_TH_ERRORS
+  TORCH_CHECK(PyUnicode_Check(py_name), "arg must be a str");
+  const char* name_cstr = PyUnicode_AsUTF8(py_name);
+  TORCH_CHECK(name_cstr != nullptr, "failed to decode operator name");
+
+  auto& dispatcher = c10::Dispatcher::singleton();
+  std::string name_str(name_cstr);
+  std::string overload;
+  auto dot_pos = name_str.rfind('.');
+  if (dot_pos != std::string::npos) {
+    overload = name_str.substr(dot_pos + 1);
+    name_str = name_str.substr(0, dot_pos);
+  }
+
+  auto op = dispatcher.findOp(c10::OperatorName(name_str, overload));
+  TORCH_CHECK(
+      op.has_value(),
+      "operator '", name_cstr, "' not found in dispatcher");
+
+  uint64_t gen = op->implGeneration();
+  return PyLong_FromUnsignedLongLong(gen);
+  END_HANDLE_TH_ERRORS
+}
+
 static PyObject* set_multithreading_enabled(
     PyObject* self,
     PyObject* args,
@@ -1934,6 +1964,7 @@ static PyMethodDef methods[] = {
      METH_NOARGS,
      nullptr},
     {"_custom_op_fast_path_check", custom_op_fast_path_check, METH_O, nullptr},
+    {"_op_impl_generation", op_impl_generation, METH_O, nullptr},
     {"_set_dispatch_mode", set_dispatch_mode, METH_O, nullptr},
     {"_get_dispatch_mode", get_dispatch_mode, METH_O, nullptr},
     {"_unset_dispatch_mode", unset_dispatch_mode, METH_O, nullptr},

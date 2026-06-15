@@ -6419,6 +6419,32 @@ class TestCustomOpFastPath(TestCase):
         grad.sum().backward()
         self.assertIsNotNone(x.grad)
 
+    def test_fast_path_disabled_by_kernel_override(self):
+        @torch.library.custom_op("_torch_testing::fp_override", mutates_args=())
+        def fp_override(x: Tensor) -> Tensor:
+            return x.clone()
+
+        @fp_override.register_fake
+        def _(x):
+            return torch.empty_like(x)
+
+        x = torch.randn(3)
+
+        with self._assert_fast_path_taken(fp_override):
+            result = fp_override(x)
+        self.assertEqual(result, x)
+
+        # Override the CPU kernel via Python Library.impl
+        lib = torch.library.Library("_torch_testing", "IMPL")
+        lib.impl("fp_override", lambda x: x * 2, "CPU")
+
+        # Fast path should be disabled; call uses the new kernel
+        with self._assert_fast_path_not_taken(fp_override):
+            result = fp_override(x)
+        self.assertEqual(result, x * 2)
+
+        del lib
+
     def test_fast_path_disabled_by_flag(self):
         import torch._library.custom_ops as co
 
