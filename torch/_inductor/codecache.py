@@ -770,16 +770,12 @@ class FxGraphCachePickler(pickle.Pickler):
 
     @staticmethod
     def _reduce_reference_opaque(obj: Any) -> Any:
-        """Produce a stable cache key for reference-opaque types.
-
-        Uses the type's registered USE_REAL members to extract identifying
-        values, producing a deterministic key without requiring the object
-        to support native pickling. Only members that return picklable
-        primitives (int, str, bool, float, tuple, None) contribute to the key.
-        """
+        """Produce a stable cache key for reference-opaque types."""
         from torch._library.opaque_object import MemberType
 
-        _KEY_TYPES = (int, str, bool, float, type(None))
+        # USE_REAL members are the values Dynamo bakes as compile-time constants.
+        # Two objects whose USE_REAL members all match produce identical compiled
+        # graphs, so they share a cache entry.
 
         t = type(obj)
         info = opaque_object.get_opaque_obj_info(t)
@@ -795,9 +791,10 @@ class FxGraphCachePickler(pickle.Pickler):
                     attr = getattr(obj, member_name)
                     value = attr() if callable(attr) else attr
                 except Exception:
-                    continue
-                if not isinstance(value, _KEY_TYPES):
-                    continue
+                    raise BypassFxGraphCache(
+                        f"Cannot produce stable cache key for reference-opaque type "
+                        f"{t.__qualname__}: USE_REAL member {member_name!r} raised"
+                    )
                 parts.append((member_name, value))
         if len(parts) == 1:
             raise BypassFxGraphCache(
