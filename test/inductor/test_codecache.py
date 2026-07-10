@@ -4438,6 +4438,56 @@ class TestFxGraphCacheHashing(TestCase):
         with self.assertRaises(BypassFxGraphCache):
             pickler.dumps(TotallyOpaque())
 
+    def test_reducer_override_reference_opaque_type(self):
+        """
+        Test that unpicklable reference-opaque types produce a stable cache key
+        derived from their registered USE_REAL members, instead of bypassing
+        the cache.
+        """
+        from torch._library.opaque_object import (
+            MemberType,
+            register_opaque_type,
+        )
+        from torch._opaque_base import OpaqueBaseMeta
+
+        class _CommHandle(metaclass=OpaqueBaseMeta):
+            def __init__(self, world_size, backend):
+                self._world_size = world_size
+                self._backend = backend
+
+            def world_size(self):
+                return self._world_size
+
+            def backend_name(self):
+                return self._backend
+
+            def __reduce_ex__(self, protocol):
+                raise TypeError("cannot pickle _CommHandle")
+
+        register_opaque_type(
+            _CommHandle,
+            typ="reference",
+            members={
+                "world_size": MemberType.USE_REAL,
+                "backend_name": MemberType.USE_REAL,
+            },
+        )
+
+        gm = torch.fx.GraphModule({}, torch.fx.Graph())
+        pickler = FxGraphCachePickler(gm)
+        self.addCleanup(
+            FxGraphCachePickler._pickleable_type_cache.pop, _CommHandle, None
+        )
+
+        obj_a = _CommHandle(world_size=4, backend="nccl")
+        obj_b = _CommHandle(world_size=4, backend="nccl")
+        obj_c = _CommHandle(world_size=2, backend="gloo")
+
+        # Same config -> same hash
+        self.assertEqual(pickler.dumps(obj_a), pickler.dumps(obj_b))
+        # Different config -> different hash
+        self.assertNotEqual(pickler.dumps(obj_a), pickler.dumps(obj_c))
+
 
 class TestCudaCompileCommand(TestCase):
     @requires_cuda_and_triton

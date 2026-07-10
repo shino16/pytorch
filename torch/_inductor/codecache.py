@@ -769,7 +769,50 @@ class FxGraphCachePickler(pickle.Pickler):
         return result
 
     @staticmethod
+    def _reduce_reference_opaque(obj: Any) -> Any:
+        """Produce a stable cache key for reference-opaque types.
+
+        Uses the type's registered USE_REAL members to extract identifying
+        values, producing a deterministic key without requiring the object
+        to support native pickling. Only members that return picklable
+        primitives (int, str, bool, float, tuple, None) contribute to the key.
+        """
+        from torch._library.opaque_object import MemberType
+
+        _KEY_TYPES = (int, str, bool, float, type(None))
+
+        t = type(obj)
+        info = opaque_object.get_opaque_obj_info(t)
+        type_id = f"{t.__module__}.{t.__qualname__}"
+        parts: list[Any] = [type_id]
+        if info is not None:
+            for member_name, member_type in sorted(info.members.items()):
+                if member_type != MemberType.USE_REAL:
+                    continue
+                if member_name.startswith("__"):
+                    continue
+                try:
+                    attr = getattr(obj, member_name)
+                    value = attr() if callable(attr) else attr
+                except Exception:
+                    continue
+                if not isinstance(value, _KEY_TYPES):
+                    continue
+                parts.append((member_name, value))
+        if len(parts) == 1:
+            raise BypassFxGraphCache(
+                f"Cannot produce stable cache key for reference-opaque type "
+                f"{t.__qualname__}: no USE_REAL members yielded values"
+            )
+        return _ident, (tuple(parts),)
+
+    @staticmethod
     def _reduce_unpicklable(obj: Any) -> Any:
+        # Reference-opaque types (e.g. ProcessGroup): produce a stable key from
+        # their registered USE_REAL members without requiring native pickle support.
+        t = type(obj)
+        if opaque_object.is_opaque_type(t) and opaque_object.is_opaque_reference_type(t):
+            return FxGraphCachePickler._reduce_reference_opaque(obj)
         key = _get_stable_obj_key(obj)
         if key is None:
             raise BypassFxGraphCache(
