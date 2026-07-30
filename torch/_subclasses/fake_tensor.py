@@ -2383,9 +2383,10 @@ class FakeTensorMode(TorchDispatchMode):
             view_arg = args[cast(int, entry.view_idx)]
             if not isinstance(view_arg, FakeTensor):  # noqa: ISINSTANCE_FAKE_TENSOR
                 raise AssertionError("view_arg must be a FakeTensor")
+        view_dtype_matches = view_arg is not None and metadata.dtype == view_arg.dtype
 
         with in_kernel_invocation_manager(self), maybe_suppress():
-            if is_view:
+            if view_dtype_matches:
                 # Recreate the alias directly instead of allocating temporary
                 # symbolic storage and rebinding it with set_.
                 view_base: Tensor = cast(FakeTensor, view_arg)
@@ -2421,6 +2422,14 @@ class FakeTensorMode(TorchDispatchMode):
             torch._C._set_conj(empty, True)
         if metadata.is_neg:
             torch._C._set_neg(empty, True)
+
+        if is_view and not view_dtype_matches:
+            # as_strided inherits its input's dtype, so dtype-changing views
+            # need the typed placeholder used by the general fallback.
+            view_base = cast(FakeTensor, view_arg)
+            storage = view_base.untyped_storage()
+            with in_kernel_invocation_manager(self), maybe_suppress():
+                empty.set_(storage, storage_offset, shape, stride)
 
         return FakeTensor(self, empty, metadata.device)
 
