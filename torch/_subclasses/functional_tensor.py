@@ -216,6 +216,9 @@ class FunctionalTensor(torch.Tensor):
             False,  # dispatch_device
             False,  # dispatch_layout
             extra_dispatch_keys,  # _extra_dispatch_keys
+            # Reuse the inner tensor's symbolic storage size instead of
+            # recomputing it from symbolic sizes and strides.
+            None if is_sparse_any(elem) else elem.untyped_storage().nbytes(),
         )
         torch._C._set_throw_on_mutable_data_ptr(out)
         out.elem = elem
