@@ -1464,7 +1464,8 @@ class _DispatchCacheEntryOutputInfo:
     metadata: TensorMetadata | None
     view_idx: int | None
     # Whether a fresh output has exactly the canonical contiguous strides and
-    # zero storage offset, so synthesis can avoid symbolic stride validation.
+    # zero storage offset without input backreferences in either, so synthesis
+    # can avoid symbolic stride validation without changing SymNode provenance.
     is_canonical_contiguous: bool = False
     constant_value: Any | None = SingletonConstant
 
@@ -2170,6 +2171,10 @@ class FakeTensorMode(TorchDispatchMode):
         metadata.shape = tuple(state.convert_output(v) for v in metadata.shape)
         metadata.stride = tuple(state.convert_output(v) for v in metadata.stride)
         metadata.storage_offset = state.convert_output(metadata.storage_offset)
+        is_canonical_contiguous = is_canonical_contiguous and not any(
+            isinstance(value, _SymIntOutputStub) and isinstance(value.value, int)
+            for value in (*metadata.stride, metadata.storage_offset)
+        )
         metadata.storage_bytes = (
             None
             if metadata.storage_bytes is None
@@ -2418,10 +2423,16 @@ class FakeTensorMode(TorchDispatchMode):
                     requires_grad=metadata.requires_grad,
                 )
 
-        if metadata.is_conj:
-            torch._C._set_conj(empty, True)
-        if metadata.is_neg:
-            torch._C._set_neg(empty, True)
+        if view_dtype_matches:
+            # as_strided inherits these bits from its input, but view ops can
+            # toggle either bit off as well as on.
+            torch._C._set_conj(empty, metadata.is_conj)
+            torch._C._set_neg(empty, metadata.is_neg)
+        else:
+            if metadata.is_conj:
+                torch._C._set_conj(empty, True)
+            if metadata.is_neg:
+                torch._C._set_neg(empty, True)
 
         if is_view and not view_dtype_matches:
             # as_strided inherits its input's dtype, so dtype-changing views
