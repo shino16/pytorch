@@ -7503,6 +7503,53 @@ for dtype in (torch.int32, torch.int64):
         if self.device != "cpu":
             assertGeneratedKernelCountEqual(self, 1)
 
+    @skipCUDAIf(not SM80OrLater, "uses bfloat16 which requires SM >= 80")
+    def test_bf16_autocast_mixed_embedding_rms_norm(self):
+        # https://github.com/pytorch/pytorch/issues/191433
+        if self.device != "cuda":
+            raise unittest.SkipTest("Only validated on CUDA")
+
+        batch, length, width = 96, 8, 192
+
+        class Model(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.embeddings = torch.nn.ModuleList(
+                    torch.nn.Embedding(4, width) for _ in range(5)
+                )
+                self.numeric = torch.nn.Linear(2, width, bias=False)
+                self.weight = torch.nn.Parameter(torch.ones(width))
+
+            def forward(self, indices, values):
+                hidden = self.embeddings[0](indices[:, :, 0])
+                for column, embedding in enumerate(self.embeddings[1:], start=1):
+                    hidden = hidden + embedding(indices[:, :, column])
+                hidden = hidden + self.numeric(values)
+                scale = hidden.float().square().mean(dim=-1, keepdim=True)
+                return hidden * torch.rsqrt(scale + 1e-6).to(hidden.dtype) * self.weight
+
+        torch.manual_seed(0)
+        model = Model().to(self.device).eval()
+        indices = (
+            torch.arange(batch * length * 5, device=self.device).reshape(
+                batch, length, 5
+            )
+            % 4
+        )
+        values = (
+            torch.arange(
+                batch * length * 2, device=self.device, dtype=torch.float32
+            ).reshape(batch, length, 2)
+            / 100.0
+        )
+        compiled = torch.compile(model, fullgraph=True, dynamic=False)
+
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            expected = model(indices, values)
+            actual = compiled(indices, values)
+
+        torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
+
     def test_layer_norm_rejects_complex_inputs(self):
         if self.device not in ("cpu", "cuda"):
             raise unittest.SkipTest("Only validated on CPU/CUDA")
