@@ -133,6 +133,7 @@ class WorkNCCL : public c10d::Work {
   std::unique_ptr<at::cuda::CUDAEvent> end_event_;
   std::shared_ptr<at::cuda::CUDAEvent> captured_end_event_;
   std::shared_ptr<at::cuda::CUDAEvent> external_end_event_;
+  std::shared_ptr<std::atomic<bool>> captured_graph_launched_;
   std::optional<c10::cuda::CaptureId_t> producer_capture_id_;
   at::cuda::CUDAStream stream_;
 

@@ -84,6 +84,17 @@ struct DestructionTracker {
   }
   bool* destroyed_;
 };
+
+struct ReentrantResetTracker {
+  ReentrantResetTracker(at::cuda::CUDAGraph* graph, bool* destroyed)
+      : graph_(graph), destroyed_(destroyed) {}
+  ~ReentrantResetTracker() {
+    *destroyed_ = true;
+    graph_->reset();
+  }
+  at::cuda::CUDAGraph* graph_;
+  bool* destroyed_;
+};
 } // namespace
 
 TEST(CUDAEventTest, testCUDAGraphRetainsCaptureResource) {
@@ -106,6 +117,105 @@ TEST(CUDAEventTest, testCUDAGraphRetainsCaptureResource) {
   graph.capture_end();
 
   EXPECT_FALSE(destroyed);
+  graph.reset();
+  EXPECT_TRUE(destroyed);
+}
+
+TEST(CUDAEventTest, testCUDAGraphReplayCallbackRunsAfterLaunch) {
+  if (!at::cuda::is_available()) {
+    return;
+  }
+
+  auto stream = at::cuda::getStreamFromPool();
+  at::cuda::CUDAStreamGuard stream_guard(stream);
+  at::cuda::CUDAGraph graph;
+  int replay_count = 0;
+
+  graph.capture_begin();
+  at::cuda::sleep(1000);
+  auto capture_id = c10::cuda::currentStreamCaptureIdMayInitCtx();
+  ASSERT_TRUE(capture_id.has_value());
+  graph.register_capture_replay_callback(
+      *capture_id, [&replay_count] { ++replay_count; });
+  graph.capture_end();
+
+  EXPECT_EQ(replay_count, 0);
+  graph.replay();
+  EXPECT_EQ(replay_count, 1);
+  graph.replay();
+  EXPECT_EQ(replay_count, 2);
+  stream.synchronize();
+}
+
+TEST(CUDAEventTest, testCUDAGraphReplayCallbackFailureRunsLaterCallbacks) {
+  if (!at::cuda::is_available()) {
+    return;
+  }
+
+  auto stream = at::cuda::getStreamFromPool();
+  at::cuda::CUDAStreamGuard stream_guard(stream);
+  at::cuda::CUDAGraph graph;
+  bool later_callback_ran = false;
+
+  graph.capture_begin();
+  at::cuda::sleep(1000);
+  auto capture_id = c10::cuda::currentStreamCaptureIdMayInitCtx();
+  ASSERT_TRUE(capture_id.has_value());
+  graph.register_capture_replay_callback(*capture_id, [] {
+    TORCH_CHECK(false, "expected replay callback failure");
+  });
+  graph.register_capture_replay_callback(
+      *capture_id, [&later_callback_ran] { later_callback_ran = true; });
+  graph.capture_end();
+
+  EXPECT_THROW(graph.replay(), c10::Error);
+  EXPECT_TRUE(later_callback_ran);
+  stream.synchronize();
+}
+
+TEST(CUDAEventTest, testCUDAGraphReleasesReplayCallbacksOutsideLock) {
+  if (!at::cuda::is_available()) {
+    return;
+  }
+
+  auto stream = at::cuda::getStreamFromPool();
+  at::cuda::CUDAStreamGuard stream_guard(stream);
+  at::cuda::CUDAGraph graph;
+  bool destroyed = false;
+
+  graph.capture_begin();
+  at::cuda::sleep(1000);
+  auto capture_id = c10::cuda::currentStreamCaptureIdMayInitCtx();
+  ASSERT_TRUE(capture_id.has_value());
+  auto resource = std::make_shared<ReentrantResetTracker>(&graph, &destroyed);
+  graph.register_capture_replay_callback(
+      *capture_id, [resource = std::move(resource)] {});
+  graph.capture_end();
+
+  EXPECT_FALSE(destroyed);
+  graph.reset();
+  EXPECT_TRUE(destroyed);
+}
+
+TEST(CUDAEventTest, testCUDAGraphReleasesResourcesOutsideBookkeepingLock) {
+  if (!at::cuda::is_available()) {
+    return;
+  }
+
+  auto stream = at::cuda::getStreamFromPool();
+  at::cuda::CUDAStreamGuard stream_guard(stream);
+  at::cuda::CUDAGraph graph;
+  bool destroyed = false;
+
+  graph.capture_begin();
+  at::cuda::sleep(1000);
+  auto capture_id = c10::cuda::currentStreamCaptureIdMayInitCtx();
+  ASSERT_TRUE(capture_id.has_value());
+  auto resource = std::make_shared<ReentrantResetTracker>(&graph, &destroyed);
+  graph.retain_capture_resource(*capture_id, resource);
+  resource.reset();
+  graph.capture_end();
+
   graph.reset();
   EXPECT_TRUE(destroyed);
 }
@@ -169,6 +279,41 @@ TEST(CUDAEventTest, testCUDAGraphConditionalCaptureEpilogue) {
   graph.capture_end();
 
   EXPECT_TRUE(epilogue_ran);
+}
+
+TEST(CUDAEventTest, testCUDAGraphConditionalEpilogueFailurePoisonsGraph) {
+  if (!at::cuda::is_available()) {
+    return;
+  }
+
+  auto stream = at::cuda::getStreamFromPool();
+  at::cuda::CUDAStreamGuard stream_guard(stream);
+  auto predicate =
+      at::zeros({}, at::TensorOptions().device(at::kCUDA).dtype(at::kBool));
+  at::cuda::CUDAGraph graph;
+  bool resource_destroyed = false;
+
+  graph.capture_begin();
+  graph.begin_capture_to_if_node(predicate);
+  at::cuda::sleep(1000);
+  auto capture_id = c10::cuda::currentStreamCaptureIdMayInitCtx();
+  ASSERT_TRUE(capture_id.has_value());
+  auto resource =
+      std::make_shared<DestructionTracker>(&resource_destroyed);
+  graph.retain_capture_resource(*capture_id, resource);
+  resource.reset();
+  graph.register_capture_epilogue(*capture_id, [](const at::cuda::CUDAStream&) {
+    TORCH_CHECK(false, "expected conditional epilogue failure");
+  });
+
+  EXPECT_THROW(graph.end_capture_to_conditional_node(), c10::Error);
+  EXPECT_FALSE(resource_destroyed);
+  EXPECT_THROW(graph.capture_end(), c10::Error);
+  EXPECT_TRUE(resource_destroyed);
+  EXPECT_EQ(
+      c10::cuda::currentStreamCaptureStatusMayInitCtx(),
+      c10::cuda::CaptureStatus::None);
+  EXPECT_THROW(graph.replay(), c10::Error);
 }
 #endif
 

@@ -8,6 +8,7 @@
 #include <c10/cuda/CUDAStream.h>
 #include <c10/util/flat_hash_map.h>
 
+#include <exception>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -50,6 +51,7 @@ TORCH_CUDA_CPP_API CUDAGraph* get_graph_from_capture_id(CaptureId_t capture_id);
 
 struct TORCH_CUDA_CPP_API CUDAGraph {
   using CaptureEpilogue = std::function<void(const CUDAStream&)>;
+  using CaptureReplayCallback = std::function<void()>;
 
   CUDAGraph(bool keep_graph=false);
   ~CUDAGraph();
@@ -103,6 +105,12 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
   void register_capture_epilogue(
       CaptureId_t capture_id,
       CaptureEpilogue epilogue);
+  // Registers a host callback that runs after each successful launch of the
+  // graph containing the capture. This is intended for capture-aware runtime
+  // bookkeeping; callbacks must not invoke CUDA APIs.
+  void register_capture_replay_callback(
+      CaptureId_t capture_id,
+      CaptureReplayCallback callback);
   // Keeps resources referenced by captured nodes alive until both the template
   // and executable graphs have been destroyed.
   void retain_capture_resource(
@@ -123,13 +131,21 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
       const Tensor& scalar_cuda_pred_tensor);
 
  private:
+  struct CaptureEndState {
+    std::vector<CaptureEpilogue> epilogues;
+    std::exception_ptr error;
+  };
+
   template <typename StreamType>
   std::function<bool(StreamType)> create_allocate_filter() const;
   std::function<bool(cudaStream_t)> create_child_allocate_filter();
   void record_retained_pool(MempoolId_t pool);
   bool has_retained_pool(MempoolId_t pool) const;
   void begin_capture_state(CaptureId_t capture_id);
-  std::vector<CaptureEpilogue> begin_capture_end(CaptureId_t capture_id);
+  CaptureEndState begin_capture_end(CaptureId_t capture_id);
+  void record_capture_error(
+      CaptureId_t capture_id,
+      std::exception_ptr error);
   void finish_capture_end(CaptureId_t capture_id, bool success);
 #if !defined(USE_ROCM) && (defined(CUDA_VERSION) && CUDA_VERSION >= 12040)
   void begin_capture_to_conditional_node(

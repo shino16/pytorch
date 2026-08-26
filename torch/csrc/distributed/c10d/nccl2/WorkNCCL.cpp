@@ -126,6 +126,7 @@ void WorkNCCL::recordEnd() {
         std::shared_ptr<at::cuda::CUDAEvent>(end_event_.release());
     external_end_event_ = std::make_shared<at::cuda::CUDAEvent>(
         cudaEventDisableTiming | cudaEventExternal);
+    captured_graph_launched_ = std::make_shared<std::atomic<bool>>(false);
     producer_capture_id_ = *capture_id;
 
     graph->retain_capture_resource(*capture_id, external_end_event_);
@@ -135,6 +136,10 @@ void WorkNCCL::recordEnd() {
         [end_event =
              captured_end_event_](const at::cuda::CUDAStream& capture_stream) {
           end_event->block(capture_stream);
+        });
+    graph->register_capture_replay_callback(
+        *capture_id, [launched = captured_graph_launched_]() {
+          launched->store(true, std::memory_order_release);
         });
 
     external_end_event_->record(stream_);
@@ -221,16 +226,28 @@ WorkNCCL::WorkStatus WorkNCCL::checkStatus(
   }
 
   if (current == WorkStatus::NOT_STARTED) {
-    try {
-      if (start_event_->query()) {
+    if (external_end_event_) {
+      // Internal events recorded into a CUDA Graph cannot be queried outside
+      // that graph. An external event also queries as complete before its
+      // graph's first replay, so wait for the graph's post-launch callback
+      // before using the event as evidence of progress or completion.
+      if (captured_graph_launched_->load(std::memory_order_acquire)) {
         WorkStatus expected = WorkStatus::NOT_STARTED;
         status_.compare_exchange_strong(
             expected, WorkStatus::INPROGRESS, std::memory_order_relaxed);
       }
-    } catch (const std::exception& e) {
-      TC_LOG(ERROR, comm_) << "CUDA error during start event query: "
-                           << e.what();
-      setTerminalStatus(WorkStatus::ERROR);
+    } else {
+      try {
+        if (start_event_->query()) {
+          WorkStatus expected = WorkStatus::NOT_STARTED;
+          status_.compare_exchange_strong(
+              expected, WorkStatus::INPROGRESS, std::memory_order_relaxed);
+        }
+      } catch (const std::exception& e) {
+        TC_LOG(ERROR, comm_)
+            << "CUDA error during start event query: " << e.what();
+        setTerminalStatus(WorkStatus::ERROR);
+      }
     }
   }
   if (status() == WorkStatus::ERROR) {
@@ -239,7 +256,9 @@ WorkNCCL::WorkStatus WorkNCCL::checkStatus(
 
   if (status() == WorkStatus::INPROGRESS) {
     try {
-      if (endEvent().query()) {
+      const auto& completion_event =
+          external_end_event_ ? *external_end_event_ : endEvent();
+      if (completion_event.query()) {
         if (setTerminalStatus(WorkStatus::COMPLETED) &&
             owned_ephemeral_timeout_.count() > 0 &&
             !ephemeral_timeout_released_.exchange(true)) {
@@ -278,8 +297,20 @@ bool WorkNCCL::isSuccess() const {
 
 void WorkNCCL::synchronizeInternal() {
   WorkStatus local_state = status();
-  if (local_state == WorkStatus::COMPLETED ||
-      local_state == WorkStatus::ERROR || local_state == WorkStatus::TIMEDOUT) {
+  auto current_stream = at::cuda::getCurrentCUDAStream(stream_.device_index());
+  auto current_capture_id = c10::cuda::captureIdMayInitCtx(current_stream);
+  if (local_state == WorkStatus::COMPLETED) {
+    if (external_end_event_ && current_capture_id.has_value()) {
+      if (auto* graph =
+              at::cuda::get_graph_from_capture_id(*current_capture_id)) {
+        graph->retain_capture_resource(
+            *current_capture_id, external_end_event_);
+      }
+      external_end_event_->block(current_stream);
+    }
+    return;
+  }
+  if (local_state == WorkStatus::ERROR || local_state == WorkStatus::TIMEDOUT) {
     return;
   }
 
@@ -292,9 +323,6 @@ void WorkNCCL::synchronizeInternal() {
 
   // Make the current stream wait for the end event recorded on the work's
   // stream, ordering subsequent current-stream ops after this collective.
-  auto current_stream =
-      at::cuda::getCurrentCUDAStream(comm_->getDevice().index());
-  auto current_capture_id = c10::cuda::captureIdMayInitCtx(current_stream);
   const bool crosses_capture = external_end_event_ &&
       producer_capture_id_.has_value() &&
       (!current_capture_id.has_value() ||

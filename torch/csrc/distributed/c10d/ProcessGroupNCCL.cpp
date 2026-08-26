@@ -878,6 +878,9 @@ void ProcessGroupNCCL::WorkNCCL::recordEndEvent(
 
   graph->retain_capture_resource(*captureId, ncclExternalEndEvent_);
   graph->retain_capture_resource(*captureId, ncclEndEvent_);
+  if (ncclStartEvent_) {
+    graph->retain_capture_resource(*captureId, ncclStartEvent_);
+  }
   graph->register_capture_epilogue(
       *captureId,
       [endEvent = ncclEndEvent_](const at::cuda::CUDAStream& captureStream) {

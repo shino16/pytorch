@@ -331,12 +331,14 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
 
         # Initialize the communicator before capture.
         c10d.all_reduce(torch.ones(1, device=device), group=self.pg)
+        self.pg._enable_collectives_timing()
 
         static_input = torch.full((16,), self.rank + 1.0, device=device)
         output = torch.empty_like(static_input)
         producer = torch.cuda.CUDAGraph()
         consumer = torch.cuda.CUDAGraph()
         with torch.cuda.graph(producer):
+            torch.cuda._sleep(20_000_000)
             output.copy_(static_input)
             work = c10d.all_reduce(output, group=self.pg, async_op=True)
         with torch.cuda.graph(consumer):
@@ -346,8 +348,14 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
         # The graphs own the captured event resources after the Work is gone.
         del work
         static_input.fill_(self.rank + 2.0)
-        producer.replay()
-        consumer.replay()
+        output.fill_(-1)
+        torch.cuda.synchronize(device)
+        producer_stream = torch.cuda.Stream(device=device)
+        consumer_stream = torch.cuda.Stream(device=device)
+        with torch.cuda.stream(producer_stream):
+            producer.replay()
+        with torch.cuda.stream(consumer_stream):
+            consumer.replay()
         torch.cuda.synchronize(device)
 
         expected = sum(rank + 2.0 for rank in range(self.world_size)) + 1
