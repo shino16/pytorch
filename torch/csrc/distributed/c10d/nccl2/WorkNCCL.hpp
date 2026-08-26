@@ -17,6 +17,7 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAEvent.h>
 #include <ATen/record_function.h>
+#include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
 
@@ -114,6 +115,8 @@ class WorkNCCL : public c10d::Work {
   WorkStatus checkStatus(
       std::optional<std::chrono::milliseconds> timeout = std::nullopt);
   void recordFunctionStart(std::string_view coll_name);
+  at::cuda::CUDAEvent& endEvent();
+  const at::cuda::CUDAEvent& endEvent() const;
   // Make the current stream wait on the work's end event (the c10d "wait"
   // semantics for CUDA work: order subsequent current-stream ops after this).
   void synchronizeInternal();
@@ -128,6 +131,9 @@ class WorkNCCL : public c10d::Work {
   bool blocking_wait_{false};
   std::unique_ptr<at::cuda::CUDAEvent> start_event_;
   std::unique_ptr<at::cuda::CUDAEvent> end_event_;
+  std::shared_ptr<at::cuda::CUDAEvent> captured_end_event_;
+  std::shared_ptr<at::cuda::CUDAEvent> external_end_event_;
+  std::optional<c10::cuda::CaptureId_t> producer_capture_id_;
   at::cuda::CUDAStream stream_;
 
   std::chrono::steady_clock::time_point work_start_time_;

@@ -6,6 +6,7 @@
 
 #include <ATen/core/ivalue.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDAGraph.h>
 #include <c10/core/DeviceGuard.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGraphsC10Utils.h>
@@ -18,6 +19,12 @@
 #include <torch/csrc/distributed/c10d/nccl2/TracingGuard.hpp>
 
 namespace c10d::nccl2 {
+
+#if defined(USE_ROCM) && ROCM_VERSION < 70000
+constexpr bool kSupportsExternalGraphEvents = false;
+#else
+constexpr bool kSupportsExternalGraphEvents = true;
+#endif
 
 WorkNCCL::WorkNCCL(
     ProcessGroupNCCL* comm,
@@ -60,11 +67,17 @@ WorkNCCL::WorkNCCL(
 }
 
 WorkNCCL::~WorkNCCL() {
-  if (!comm_) {
+  // A managed CUDA Graph may outlive its process group. Its events are owned
+  // by the graph and must not be returned through the process group's cache.
+  if (!comm_ || captured_end_event_) {
     return;
   }
-  comm_->returnEvent(std::move(start_event_), timing_enabled_);
-  comm_->returnEvent(std::move(end_event_), timing_enabled_);
+  if (start_event_) {
+    comm_->returnEvent(std::move(start_event_), timing_enabled_);
+  }
+  if (end_event_) {
+    comm_->returnEvent(std::move(end_event_), timing_enabled_);
+  }
 }
 
 void WorkNCCL::recordFunctionStart(std::string_view coll_name) {
@@ -95,8 +108,40 @@ void WorkNCCL::recordStart(std::string_view coll_name) {
   start_event_->record(stream_);
 }
 
+at::cuda::CUDAEvent& WorkNCCL::endEvent() {
+  return captured_end_event_ ? *captured_end_event_ : *end_event_;
+}
+
+const at::cuda::CUDAEvent& WorkNCCL::endEvent() const {
+  return captured_end_event_ ? *captured_end_event_ : *end_event_;
+}
+
 void WorkNCCL::recordEnd() {
-  end_event_->record(stream_);
+  auto capture_id = c10::cuda::captureIdMayInitCtx(stream_);
+  auto* graph = capture_id.has_value()
+      ? at::cuda::get_graph_from_capture_id(*capture_id)
+      : nullptr;
+  if (kSupportsExternalGraphEvents && capture_id.has_value() && graph) {
+    captured_end_event_ =
+        std::shared_ptr<at::cuda::CUDAEvent>(end_event_.release());
+    external_end_event_ = std::make_shared<at::cuda::CUDAEvent>(
+        cudaEventDisableTiming | cudaEventExternal);
+    producer_capture_id_ = *capture_id;
+
+    graph->retain_capture_resource(*capture_id, external_end_event_);
+    graph->retain_capture_resource(*capture_id, captured_end_event_);
+    graph->register_capture_epilogue(
+        *capture_id,
+        [end_event =
+             captured_end_event_](const at::cuda::CUDAStream& capture_stream) {
+          end_event->block(capture_stream);
+        });
+
+    external_end_event_->record(stream_);
+    captured_end_event_->record(stream_);
+  } else {
+    end_event_->record(stream_);
+  }
 
   if (recordFunction_ && recordFunction_->isActive()) {
     recordFunction_->end();
@@ -194,7 +239,7 @@ WorkNCCL::WorkStatus WorkNCCL::checkStatus(
 
   if (status() == WorkStatus::INPROGRESS) {
     try {
-      if (end_event_->query()) {
+      if (endEvent().query()) {
         if (setTerminalStatus(WorkStatus::COMPLETED) &&
             owned_ephemeral_timeout_.count() > 0 &&
             !ephemeral_timeout_released_.exchange(true)) {
@@ -249,7 +294,23 @@ void WorkNCCL::synchronizeInternal() {
   // stream, ordering subsequent current-stream ops after this collective.
   auto current_stream =
       at::cuda::getCurrentCUDAStream(comm_->getDevice().index());
-  end_event_->block(current_stream);
+  auto current_capture_id = c10::cuda::captureIdMayInitCtx(current_stream);
+  const bool crosses_capture = external_end_event_ &&
+      producer_capture_id_.has_value() &&
+      (!current_capture_id.has_value() ||
+       *current_capture_id != *producer_capture_id_);
+  if (crosses_capture) {
+    if (current_capture_id.has_value()) {
+      if (auto* graph =
+              at::cuda::get_graph_from_capture_id(*current_capture_id)) {
+        graph->retain_capture_resource(
+            *current_capture_id, external_end_event_);
+      }
+    }
+    external_end_event_->block(current_stream);
+  } else {
+    endEvent().block(current_stream);
+  }
 
   // For a synchronous barrier, mirror stock ProcessGroupNCCL by host-blocking
   // the CPU thread until prior current-stream work has completed, not just
@@ -329,15 +390,17 @@ float WorkNCCL::getDuration() const {
   TORCH_CHECK(
       timing_enabled_,
       "getDuration only works if timing was enabled, see ProcessGroup::_enable_collectives_timing");
-  TORCH_CHECK(start_event_ && end_event_, "getDuration requires CUDA events");
+  TORCH_CHECK(
+      start_event_ && (end_event_ || captured_end_event_),
+      "getDuration requires CUDA events");
   // A coalesced work owns the last op of the group and holds the earlier ops as
   // children, so span from the first op's start event to this work's end event.
   const auto& start_event =
       children_.empty() ? *start_event_ : *children_.front()->start_event_;
   TORCH_CHECK(
-      end_event_->isCreated() && end_event_->query(),
+      endEvent().isCreated() && endEvent().query(),
       "getDuration only works after the work has completed");
-  return start_event.elapsed_time(*end_event_);
+  return start_event.elapsed_time(endEvent());
 }
 
 uint64_t WorkNCCL::getSequencenumber() const {

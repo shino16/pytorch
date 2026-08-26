@@ -23,6 +23,7 @@ from torch.testing._internal.common_distributed import (
     requires_nccl_version,
     skip_if_lt_x_gpu,
     skip_if_rocm_ver_atleast_multiprocess,
+    skip_if_rocm_ver_lessthan_multiprocess,
 )
 from torch.testing._internal.common_utils import (
     IS_FBCODE,
@@ -124,6 +125,34 @@ class ProcessGroupNCCL2Test(MultiProcContinuousTest):
         tensor = torch.empty(4, dtype=torch.float4_e2m1fn_x2, device=self.device)
         with self.assertRaisesRegex(RuntimeError, "Unsupported Float4"):
             dist.all_reduce(tensor)
+
+    @requires_nccl()
+    @skip_if_rocm_ver_lessthan_multiprocess([7, 0])
+    @skip_if_lt_x_gpu(2)
+    def test_allreduce_wait_across_cudagraphs(self) -> None:
+        # Initialize the communicator before capture.
+        dist.all_reduce(torch.ones(1, device=self.device))
+
+        static_input = torch.full((16,), self.rank + 1.0, device=self.device)
+        output = torch.empty_like(static_input)
+        producer = torch.cuda.CUDAGraph()
+        consumer = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(producer):
+            output.copy_(static_input)
+            work = dist.all_reduce(output, async_op=True)
+        with torch.cuda.graph(consumer):
+            work.wait()
+            output.add_(1)
+
+        # The graphs own the captured event resources after the Work is gone.
+        del work
+        static_input.fill_(self.rank + 2.0)
+        producer.replay()
+        consumer.replay()
+        torch.cuda.synchronize(self.device)
+
+        expected = sum(rank + 2.0 for rank in range(self.world_size)) + 1
+        self.assertEqual(output, torch.full_like(output, expected))
 
     @requires_nccl()
     @requires_nccl_version((2, 24), "Need NCCL 2.24+ for Float8")

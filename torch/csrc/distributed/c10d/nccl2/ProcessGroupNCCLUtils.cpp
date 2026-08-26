@@ -4,6 +4,7 @@
 
 #include <torch/csrc/distributed/c10d/nccl2/ProcessGroupNCCL.hpp>
 
+#include <ATen/cuda/CUDAGraph.h>
 #include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <nccl.h>
 #include <torch/csrc/distributed/c10d/nccl2/Logging.hpp>
@@ -17,6 +18,12 @@
 namespace c10d::nccl2 {
 
 namespace {
+
+#if defined(USE_ROCM) && ROCM_VERSION < 70000
+constexpr bool kSupportsExternalGraphEvents = false;
+#else
+constexpr bool kSupportsExternalGraphEvents = true;
+#endif
 
 // Scaling factor for a PREMUL_SUM reduction: either a per-element device tensor
 // or a host scalar.
@@ -463,6 +470,15 @@ void ProcessGroupNCCL::enqueueWork(
   if (getGraphCaptureMode()) {
     auto capture_info = c10::cuda::captureInfoMayInitCtx(stream);
     if (capture_info.status == c10::cuda::CaptureStatus::Active) {
+      if (auto* graph = kSupportsExternalGraphEvents
+              ? at::cuda::get_graph_from_capture_id(capture_info.id)
+              : nullptr) {
+        graph->retain_capture_resource(
+            capture_info.id,
+            std::make_shared<c10::intrusive_ptr<WorkNCCL>>(std::move(work)));
+        return;
+      }
+
       std::lock_guard<std::mutex> lock(graph_capture_work_mutex_);
 
       // Check if this is the first work object for this graph
