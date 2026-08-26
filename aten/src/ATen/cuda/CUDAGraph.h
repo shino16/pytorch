@@ -8,7 +8,9 @@
 #include <c10/cuda/CUDAStream.h>
 #include <c10/util/flat_hash_map.h>
 
+#include <functional>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <stack>
 #include <vector>
@@ -47,6 +49,8 @@ struct CUDAGraph;
 TORCH_CUDA_CPP_API CUDAGraph* get_graph_from_capture_id(CaptureId_t capture_id);
 
 struct TORCH_CUDA_CPP_API CUDAGraph {
+  using CaptureEpilogue = std::function<void(const CUDAStream&)>;
+
   CUDAGraph(bool keep_graph=false);
   ~CUDAGraph();
 
@@ -93,6 +97,17 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
   MempoolId_t pool();
   std::vector<MempoolId_t> pools();
   void retain_pool(MempoolId_t pool);
+  // Registers work that must be captured immediately before the stream's
+  // cudaStreamEndCapture. The capture ID may identify either the top-level
+  // capture or a conditional-node child capture owned by this CUDAGraph.
+  void register_capture_epilogue(
+      CaptureId_t capture_id,
+      CaptureEpilogue epilogue);
+  // Keeps resources referenced by captured nodes alive until both the template
+  // and executable graphs have been destroyed.
+  void retain_capture_resource(
+      CaptureId_t capture_id,
+      std::shared_ptr<void> resource);
   void enable_debug_mode();
   cudaGraph_t raw_cuda_graph();
   cudaGraphExec_t raw_cuda_graph_exec();
@@ -113,6 +128,9 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
   std::function<bool(cudaStream_t)> create_child_allocate_filter();
   void record_retained_pool(MempoolId_t pool);
   bool has_retained_pool(MempoolId_t pool) const;
+  void begin_capture_state(CaptureId_t capture_id);
+  std::vector<CaptureEpilogue> begin_capture_end(CaptureId_t capture_id);
+  void finish_capture_end(CaptureId_t capture_id, bool success);
 #if !defined(USE_ROCM) && (defined(CUDA_VERSION) && CUDA_VERSION >= 12040)
   void begin_capture_to_conditional_node(
       const Tensor& scalar_cuda_pred_tensor,
