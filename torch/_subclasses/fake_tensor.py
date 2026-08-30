@@ -1375,6 +1375,8 @@ class TensorMetadata:
 
 def _same_int_expr(a: _MetadataIntLike, b: _MetadataIntLike) -> bool:
     if isinstance(a, _SymIntOutputStub) or isinstance(b, _SymIntOutputStub):
+        # An int payload is a backreference to an input SymNode. Recomputing
+        # the value would lose that node identity.
         return (
             isinstance(a, _SymIntOutputStub)
             and isinstance(b, _SymIntOutputStub)
@@ -2175,9 +2177,10 @@ class FakeTensorMode(TorchDispatchMode):
             view_idx = idxs[0]
 
         metadata = extract_tensor_metadata(output)
+        storage_offset = metadata.storage_offset
         metadata.shape = tuple(state.convert_output(v) for v in metadata.shape)
         metadata.stride = tuple(state.convert_output(v) for v in metadata.stride)
-        metadata.storage_offset = state.convert_output(metadata.storage_offset)
+        metadata.storage_offset = state.convert_output(storage_offset)
         metadata.storage_bytes = (
             None
             if metadata.storage_bytes is None
@@ -2188,7 +2191,10 @@ class FakeTensorMode(TorchDispatchMode):
         is_canonical_contiguous = (
             view_idx is None
             and metadata.layout == torch.strided
-            and statically_known_true(output.storage_offset() == 0)
+            and statically_known_true(storage_offset == 0)
+            and _same_int_expr(
+                metadata.storage_offset, state.convert_output(storage_offset)
+            )
             and all(
                 _same_int_expr(actual, state.convert_output(expected))
                 for actual, expected in zip(
