@@ -24,6 +24,7 @@ from torch.testing._internal.common_distributed import (
     requires_nccl_version,
     skip_if_lt_x_gpu,
     skip_if_rocm_ver_atleast_multiprocess,
+    skip_if_rocm_ver_lessthan_multiprocess,
 )
 from torch.testing._internal.common_utils import (
     IS_FBCODE,
@@ -153,6 +154,64 @@ class ProcessGroupNCCL2Test(MultiProcContinuousTest):
         tensor = torch.empty(4, dtype=torch.float4_e2m1fn_x2, device=self.device)
         with self.assertRaisesRegex(RuntimeError, "Unsupported Float4"):
             dist.all_reduce(tensor)
+
+    @requires_nccl()
+    @skip_if_rocm_ver_lessthan_multiprocess([7, 0])
+    @skip_if_lt_x_gpu(2)
+    def test_allreduce_wait_across_cudagraphs(self) -> None:
+        # Initialize the communicator before capture.
+        dist.all_reduce(torch.ones(1, device=self.device))
+
+        static_input = torch.full((16,), self.rank + 1.0, device=self.device)
+        output = torch.empty_like(static_input)
+        producer = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(producer):
+            torch.cuda._sleep(20_000_000)
+            output.copy_(static_input)
+            work = dist.all_reduce(output, async_op=True)
+
+        # An external event is initially queryable even though its captured
+        # record node has not run. The Work must not mistake that for success.
+        self.assertFalse(work.is_completed())
+        producer.replay()
+        torch.cuda.synchronize(self.device)
+        self.assertTrue(work.is_completed())
+
+        consumer = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(consumer):
+            work.wait()
+            output.add_(1)
+
+        # The graphs own the captured event resources after the Work is gone.
+        del work
+        static_input.fill_(self.rank + 2.0)
+        output.fill_(-1)
+        torch.cuda.synchronize(self.device)
+        producer_stream = torch.cuda.Stream(device=self.device)
+        consumer_stream = torch.cuda.Stream(device=self.device)
+        with torch.cuda.stream(producer_stream):
+            producer.replay()
+        with torch.cuda.stream(consumer_stream):
+            consumer.replay()
+        torch.cuda.synchronize(self.device)
+
+        expected = sum(rank + 2.0 for rank in range(self.world_size)) + 1
+        self.assertEqual(output, torch.full_like(output, expected))
+
+    @requires_nccl()
+    @skip_if_rocm_ver_lessthan_multiprocess([7, 0])
+    @skip_if_lt_x_gpu(2)
+    def test_cudagraph_work_times_out_before_first_replay(self) -> None:
+        # Initialize the communicator before capture.
+        dist.all_reduce(torch.ones(1, device=self.device))
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            work = dist.all_reduce(torch.ones(1, device=self.device), async_op=True)
+
+        self.assertFalse(work.is_completed())
+        with self.assertRaisesRegex(RuntimeError, "NCCL operation timed out"):
+            work.wait(timedelta(milliseconds=1))
 
     @requires_nccl()
     @requires_nccl_version((2, 24), "Need NCCL 2.24+ for Float8")

@@ -29,6 +29,7 @@ from torch.testing._internal.common_distributed import (
     MultiProcContinuousTest,
     requires_nccl,
     requires_nccl_version,
+    skip_if_rocm_ver_lessthan_multiprocess,
 )
 from torch.testing._internal.common_utils import (
     IS_LINUX,
@@ -319,6 +320,46 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
             graph.replay()
             expected_val *= self.world_size
             self.assertEqual(xs.item(), expected_val)
+
+    @requires_nccl()
+    @skip_if_rocm_ver_lessthan_multiprocess([7, 0])
+    @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
+    def test_allreduce_wait_across_cudagraphs(self):
+        local_device_idx = self.rank_to_GPU[self.rank][0]
+        torch.cuda.set_device(local_device_idx)
+        device = torch.device("cuda", local_device_idx)
+
+        # Initialize the communicator before capture.
+        c10d.all_reduce(torch.ones(1, device=device), group=self.pg)
+        self.pg._enable_collectives_timing()
+
+        static_input = torch.full((16,), self.rank + 1.0, device=device)
+        output = torch.empty_like(static_input)
+        producer = torch.cuda.CUDAGraph()
+        consumer = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(producer):
+            torch.cuda._sleep(20_000_000)
+            output.copy_(static_input)
+            work = c10d.all_reduce(output, group=self.pg, async_op=True)
+        with torch.cuda.graph(consumer):
+            work.wait()
+            output.add_(1)
+
+        # The graphs own the captured event resources after the Work is gone.
+        del work
+        static_input.fill_(self.rank + 2.0)
+        output.fill_(-1)
+        torch.cuda.synchronize(device)
+        producer_stream = torch.cuda.Stream(device=device)
+        consumer_stream = torch.cuda.Stream(device=device)
+        with torch.cuda.stream(producer_stream):
+            producer.replay()
+        with torch.cuda.stream(consumer_stream):
+            consumer.replay()
+        torch.cuda.synchronize(device)
+
+        expected = sum(rank + 2.0 for rank in range(self.world_size)) + 1
+        self.assertEqual(output, torch.full_like(output, expected))
 
     @unittest.skipIf(TEST_WITH_ROCM, "https://github.com/pytorch/pytorch/issues/157896")
     @requires_nccl()

@@ -8,8 +8,12 @@
 #include <ATen/Functions.h>
 #include <c10/cuda/CUDAAllocatorConfig.h>
 #include <c10/cuda/CUDAFunctions.h>
+#include <c10/util/Logging.h>
+#include <c10/util/ScopeExit.h>
 
+#include <atomic>
 #include <cstddef>
+#include <exception>
 #include <optional>
 
 namespace at::cuda {
@@ -22,6 +26,65 @@ namespace at::cuda {
 static std::mutex _currently_capturing_graphs_mutex;
 static ska::flat_hash_map<CaptureId_t, CUDAGraph*> _currently_capturing_graphs;
 
+struct CaptureState {
+  CUDAGraph* graph;
+  bool ending{false};
+  std::vector<CUDAGraph::CaptureEpilogue> epilogues;
+  std::vector<CUDAGraph::CaptureReplayCallback> replay_callbacks;
+  std::vector<std::shared_ptr<void>> resources;
+  std::exception_ptr error;
+};
+
+// Keep capture epilogues and their resources out of CUDAGraph itself so adding
+// this internal facility does not change the size of the exported C++ class.
+static std::mutex _capture_state_mutex;
+static ska::flat_hash_map<CaptureId_t, CaptureState> _capture_states;
+static ska::flat_hash_map<CUDAGraph*, std::vector<std::shared_ptr<void>>>
+    _retained_capture_resources;
+
+struct ReplayCallbackState {
+  std::vector<CUDAGraph::CaptureReplayCallback> callbacks;
+};
+
+static ska::flat_hash_map<CUDAGraph*, std::shared_ptr<ReplayCallbackState>>
+    _capture_replay_callbacks;
+static std::atomic<size_t> _graphs_with_replay_callbacks{0};
+static std::atomic<uint64_t> _replay_callback_registry_generation{0};
+
+struct ReplayCallbackCache {
+  CUDAGraph* graph{nullptr};
+  uint64_t registry_generation{0};
+  std::weak_ptr<const ReplayCallbackState> state;
+};
+
+static thread_local ReplayCallbackCache _replay_callback_cache;
+
+static std::shared_ptr<const ReplayCallbackState> get_replay_callback_state(
+    CUDAGraph* graph) {
+  // Keep ordinary CUDAGraph replay free of registry locking. Callback-bearing
+  // graphs are rare, and capture/reset mutations invalidate the thread-local
+  // cache used by repeated replays.
+  if (_graphs_with_replay_callbacks.load(std::memory_order_acquire) == 0) {
+    return nullptr;
+  }
+  const auto registry_generation =
+      _replay_callback_registry_generation.load(std::memory_order_acquire);
+  if (_replay_callback_cache.graph == graph &&
+      _replay_callback_cache.registry_generation == registry_generation) {
+    return _replay_callback_cache.state.lock();
+  }
+
+  std::shared_ptr<const ReplayCallbackState> state;
+  {
+    std::lock_guard<std::mutex> lock(_capture_state_mutex);
+    auto it = _capture_replay_callbacks.find(graph);
+    if (it != _capture_replay_callbacks.end()) {
+      state = it->second;
+    }
+  }
+  _replay_callback_cache = {graph, registry_generation, state};
+  return state;
+}
 
 #if defined(USE_ROCM)
 // Returns true when at least one CUDAGraph capture is currently active in this
@@ -109,6 +172,138 @@ void CUDAGraph::retain_pool(MempoolId_t pool) {
   record_retained_pool(pool);
 }
 
+void CUDAGraph::begin_capture_state(CaptureId_t capture_id) {
+  std::lock_guard<std::mutex> lock(_capture_state_mutex);
+  auto [it, inserted] =
+      _capture_states.emplace(capture_id, CaptureState{this});
+  TORCH_INTERNAL_ASSERT(
+      inserted,
+      "Duplicate CUDAGraph capture state for capture ID ",
+      capture_id);
+}
+
+void CUDAGraph::register_capture_epilogue(
+    CaptureId_t capture_id,
+    CaptureEpilogue epilogue) {
+  TORCH_CHECK(epilogue, "CUDAGraph capture epilogue must be callable.");
+  std::lock_guard<std::mutex> lock(_capture_state_mutex);
+  auto it = _capture_states.find(capture_id);
+  TORCH_CHECK(
+      it != _capture_states.end() && it->second.graph == this &&
+          !it->second.ending,
+      "Cannot register an epilogue for inactive CUDA Graph capture ",
+      capture_id,
+      ".");
+  it->second.epilogues.push_back(std::move(epilogue));
+}
+
+void CUDAGraph::register_capture_replay_callback(
+    CaptureId_t capture_id,
+    CaptureReplayCallback callback) {
+  TORCH_CHECK(callback, "CUDAGraph replay callback must be callable.");
+  std::lock_guard<std::mutex> lock(_capture_state_mutex);
+  auto it = _capture_states.find(capture_id);
+  TORCH_CHECK(
+      it != _capture_states.end() && it->second.graph == this &&
+          !it->second.ending,
+      "Cannot register a replay callback for inactive CUDA Graph capture ",
+      capture_id,
+      ".");
+  it->second.replay_callbacks.push_back(std::move(callback));
+}
+
+void CUDAGraph::retain_capture_resource(
+    CaptureId_t capture_id,
+    std::shared_ptr<void> resource) {
+  TORCH_CHECK(resource, "CUDAGraph cannot retain a null capture resource.");
+  std::lock_guard<std::mutex> lock(_capture_state_mutex);
+  auto it = _capture_states.find(capture_id);
+  TORCH_CHECK(
+      it != _capture_states.end() && it->second.graph == this &&
+          !it->second.ending,
+      "Cannot retain a resource for inactive CUDA Graph capture ",
+      capture_id,
+      ".");
+  it->second.resources.push_back(std::move(resource));
+}
+
+CUDAGraph::CaptureEndState CUDAGraph::begin_capture_end(
+    CaptureId_t capture_id) {
+  std::lock_guard<std::mutex> lock(_capture_state_mutex);
+  auto it = _capture_states.find(capture_id);
+  if (it == _capture_states.end() || it->second.graph != this) {
+    return {};
+  }
+  it->second.ending = true;
+  return {std::move(it->second.epilogues), it->second.error};
+}
+
+void CUDAGraph::record_capture_error(
+    CaptureId_t capture_id,
+    std::exception_ptr error) {
+  TORCH_INTERNAL_ASSERT(error);
+  std::lock_guard<std::mutex> lock(_capture_state_mutex);
+  auto it = _capture_states.find(capture_id);
+  if (it != _capture_states.end() && it->second.graph == this &&
+      !it->second.error) {
+    it->second.error = std::move(error);
+  }
+}
+
+void CUDAGraph::finish_capture_end(CaptureId_t capture_id, bool success) {
+  std::vector<CaptureReplayCallback> callbacks_to_release;
+  std::shared_ptr<ReplayCallbackState> callback_state_to_release;
+  std::vector<std::shared_ptr<void>> resources_to_release;
+  {
+    std::lock_guard<std::mutex> lock(_capture_state_mutex);
+    auto it = _capture_states.find(capture_id);
+    if (it == _capture_states.end() || it->second.graph != this) {
+      return;
+    }
+    if (success) {
+      if (!it->second.replay_callbacks.empty()) {
+        auto callbacks_it = _capture_replay_callbacks.find(this);
+        if (callbacks_it == _capture_replay_callbacks.end()) {
+          callbacks_it = _capture_replay_callbacks
+                             .emplace(
+                                 this, std::make_shared<ReplayCallbackState>())
+                             .first;
+          _graphs_with_replay_callbacks.fetch_add(1, std::memory_order_release);
+        }
+        for (auto& callback : it->second.replay_callbacks) {
+          callbacks_it->second->callbacks.push_back(std::move(callback));
+        }
+        _replay_callback_registry_generation.fetch_add(
+            1, std::memory_order_release);
+      }
+      for (auto& resource : it->second.resources) {
+        _retained_capture_resources[this].push_back(std::move(resource));
+      }
+    } else {
+      callbacks_to_release = std::move(it->second.replay_callbacks);
+      resources_to_release = std::move(it->second.resources);
+    }
+    _capture_states.erase(it);
+    if (!success && capture_id == capture_id_) {
+      auto callbacks_it = _capture_replay_callbacks.find(this);
+      if (callbacks_it != _capture_replay_callbacks.end()) {
+        callback_state_to_release = std::move(callbacks_it->second);
+        _capture_replay_callbacks.erase(callbacks_it);
+        _graphs_with_replay_callbacks.fetch_sub(1, std::memory_order_release);
+        _replay_callback_registry_generation.fetch_add(
+            1, std::memory_order_release);
+      }
+      auto retained_it = _retained_capture_resources.find(this);
+      if (retained_it != _retained_capture_resources.end()) {
+        for (auto& resource : retained_it->second) {
+          resources_to_release.push_back(std::move(resource));
+        }
+        _retained_capture_resources.erase(retained_it);
+      }
+    }
+  }
+}
+
 template <>
 std::function<bool(cudaStream_t)> CUDAGraph::create_allocate_filter<cudaStream_t>() const {
   return [this](cudaStream_t stream) {
@@ -191,6 +386,7 @@ void CUDAGraph::capture_begin(MempoolId_t pool/*={0,0}*/, cudaStreamCaptureMode 
   TORCH_INTERNAL_ASSERT(capture_id_opt.has_value(),
       "Stream should be actively capturing after cudaStreamBeginCapture");
   capture_id_ = capture_id_opt.value();
+  begin_capture_state(capture_id_);
 
   {
     std::lock_guard<std::mutex> lock(_currently_capturing_graphs_mutex);
@@ -211,17 +407,27 @@ void CUDAGraph::capture_end_pre() {
   TORCH_CHECK(stream.stream() == capture_stream_.stream(),
               "Capture must end on the same stream it began on.");
 
+  auto capture_end_state = begin_capture_end(capture_id_);
+  std::exception_ptr epilogue_error = capture_end_state.error;
+  for (auto& epilogue : capture_end_state.epilogues) {
+    try {
+      epilogue(stream);
+    } catch (...) {
+      if (!epilogue_error) {
+        epilogue_error = std::current_exception();
+      }
+    }
+  }
+
   // Capture is over once cudaStreamEndCapture returns (success or failure).
   // Clear bookkeeping before propagating the return status so watchdog-side
   // checks cannot observe stale "capture active" state on error paths.
   cudaError_t endCaptureErr = cudaStreamEndCapture(capture_stream_, &graph_);
   c10::cuda::CUDACachingAllocator::markCaptureEnd(capture_dev_);
+  bool erased_capture = false;
   {
     std::unique_lock<std::mutex> lock(_currently_capturing_graphs_mutex);
-    TORCH_CHECK(
-        _currently_capturing_graphs.count(capture_id_),
-        "capture_end() called before capture_begin().");
-    _currently_capturing_graphs.erase(capture_id_);
+    erased_capture = _currently_capturing_graphs.erase(capture_id_) == 1;
   }
 
   // End pool allocation before checking the capture error. This ensures
@@ -234,6 +440,27 @@ void CUDAGraph::capture_end_pre() {
   // Allocation recording has stopped (even if endCaptureErr is a failure), so
   // reset() must not end the pool again.
   capturing_to_pool_ = false;
+
+  const bool capture_succeeded =
+      endCaptureErr == cudaSuccess && graph_ != nullptr && !epilogue_error;
+  if (!capture_succeeded) {
+    if (graph_ != nullptr) {
+      C10_CUDA_CHECK_WARN(cudaGraphDestroy(graph_));
+      graph_ = nullptr;
+    }
+    finish_capture_end(capture_id_, false);
+    TORCH_INTERNAL_ASSERT(
+        erased_capture, "capture_end() called before capture_begin().");
+    if (epilogue_error) {
+      std::rethrow_exception(epilogue_error);
+    }
+    AT_CUDA_CHECK(endCaptureErr);
+    TORCH_CHECK(graph_ != nullptr, "Invalid capture.");
+  }
+
+  finish_capture_end(capture_id_, true);
+  TORCH_INTERNAL_ASSERT(
+      erased_capture, "capture_end() called before capture_begin().");
   AT_CUDA_CHECK(endCaptureErr);
 
   TORCH_CHECK(graph_ != nullptr, "Invalid capture.");
@@ -313,12 +540,29 @@ void CUDAGraph::replay() {
 
   c10::OptionalDeviceGuard device_guard{capture_stream_.device()};
 
+  auto replay_callback_state = get_replay_callback_state(this);
+
   for (auto& [generator_state, wholegraph_increment] :
        captured_generator_states_) {
     generator_state->replay_prologue(capture_id_, wholegraph_increment);
   }
   // graph_exec_ may be replayed in any stream.
   AT_CUDA_CHECK(cudaGraphLaunch(graph_exec_, at::cuda::getCurrentCUDAStream()));
+  std::exception_ptr callback_error;
+  if (replay_callback_state) {
+    for (const auto& callback : replay_callback_state->callbacks) {
+      try {
+        callback();
+      } catch (...) {
+        if (!callback_error) {
+          callback_error = std::current_exception();
+        }
+      }
+    }
+  }
+  if (callback_error) {
+    std::rethrow_exception(callback_error);
+  }
 }
 
 void CUDAGraph::enable_debug_mode() {
@@ -345,6 +589,61 @@ cudaGraphExec_t CUDAGraph::raw_cuda_graph_exec() {
 }
 
 void CUDAGraph::reset() {
+  // Remove global ownership first so even a later allocator-cleanup exception
+  // cannot leave dangling CUDAGraph pointers behind. Keep the payloads in
+  // locals, declared before the scope guard, so graphs are destroyed before
+  // arbitrary retained objects and epilogue closures are released.
+  std::vector<CaptureEpilogue> capture_epilogues_to_release;
+  std::vector<CaptureReplayCallback> capture_callbacks_to_release;
+  std::shared_ptr<ReplayCallbackState> callback_state_to_release;
+  std::vector<std::shared_ptr<void>> capture_resources_to_release;
+  auto destroy_graphs_on_exit = c10::make_scope_exit([this] {
+    if (has_graph_) {
+      C10_CUDA_CHECK_WARN(cudaGraphDestroy(graph_));
+      graph_ = nullptr;
+      has_graph_ = false;
+    }
+    if (has_graph_exec_) {
+      C10_CUDA_CHECK_WARN(cudaGraphExecDestroy(graph_exec_));
+      graph_exec_ = nullptr;
+      has_graph_exec_ = false;
+    }
+  });
+  {
+    std::lock_guard<std::mutex> lock(_capture_state_mutex);
+    for (auto it = _capture_states.begin(); it != _capture_states.end();) {
+      if (it->second.graph != this) {
+        ++it;
+        continue;
+      }
+      for (auto& epilogue : it->second.epilogues) {
+        capture_epilogues_to_release.push_back(std::move(epilogue));
+      }
+      for (auto& callback : it->second.replay_callbacks) {
+        capture_callbacks_to_release.push_back(std::move(callback));
+      }
+      for (auto& resource : it->second.resources) {
+        capture_resources_to_release.push_back(std::move(resource));
+      }
+      it = _capture_states.erase(it);
+    }
+    auto callbacks_it = _capture_replay_callbacks.find(this);
+    if (callbacks_it != _capture_replay_callbacks.end()) {
+      callback_state_to_release = std::move(callbacks_it->second);
+      _capture_replay_callbacks.erase(callbacks_it);
+      _graphs_with_replay_callbacks.fetch_sub(1, std::memory_order_release);
+      _replay_callback_registry_generation.fetch_add(
+          1, std::memory_order_release);
+    }
+    auto retained_it = _retained_capture_resources.find(this);
+    if (retained_it != _retained_capture_resources.end()) {
+      for (auto& resource : retained_it->second) {
+        capture_resources_to_release.push_back(std::move(resource));
+      }
+      _retained_capture_resources.erase(retained_it);
+    }
+  }
+
   // These checks warn instead of throwing: reset() is called from the
   // destructor, and at least one CI build refuses to compile with a throwing
   // destructor. Resource cleanup lives here in C++ so it runs on garbage
@@ -396,14 +695,6 @@ void CUDAGraph::reset() {
     capture_ended_ = false;
     allocated_pool_ = false;
   }
-  if (has_graph_) {
-    C10_CUDA_CHECK_WARN(cudaGraphDestroy(graph_));
-    has_graph_ = false;
-  }
-  if (has_graph_exec_) {
-    C10_CUDA_CHECK_WARN(cudaGraphExecDestroy(graph_exec_));
-    has_graph_exec_ = false;
-  }
 #if !defined(USE_ROCM) && (defined(CUDA_VERSION) && CUDA_VERSION >= 12040)
   while (!conditional_node_raw_streams_.empty()) {
     conditional_node_raw_streams_.pop();
@@ -425,19 +716,25 @@ std::vector<MempoolId_t> CUDAGraph::pools() {
 }
 
 CUDAGraph::~CUDAGraph() {
-  reset();
+  try {
+    reset();
 
 // There are recent HIP changes where hipGraphExecDestroy doesn't immediately free memory.
 // They wait for next sync point in order to free the memory, this is to ensure that all
 // hipGraphLaunch are finished before we release any memory. This feature was enabled in rocm6.2.
 // We need to ensure all async operations finish before deleting the object.
 #if defined(USE_ROCM)
-  if (capture_dev_ != UNDEFINED_DEVICE) // check if capture_dev_ contains the real device id
-  {
-    AT_CUDA_CHECK(cudaSetDevice(capture_dev_));
-    AT_CUDA_CHECK(cudaDeviceSynchronize());
-  }
+    if (capture_dev_ != UNDEFINED_DEVICE) // check if capture_dev_ contains the real device id
+    {
+      AT_CUDA_CHECK(cudaSetDevice(capture_dev_));
+      AT_CUDA_CHECK(cudaDeviceSynchronize());
+    }
 #endif
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "Failed to clean up CUDAGraph: " << e.what();
+  } catch (...) {
+    LOG(ERROR) << "Failed to clean up CUDAGraph: unknown exception";
+  }
 }
 
 CUDAGraph* CUDAGraph::get_currently_capturing_graph() {
@@ -591,6 +888,7 @@ getCurrentCUDAStream(), &cond_node, nullptr, 1, cudaStreamSetCaptureDependencies
   TORCH_INTERNAL_ASSERT(child_capture_id_opt.has_value(),
       "Child stream should be actively capturing after cudaStreamBeginCaptureToGraph");
   conditional_graph_capture_ids_.top() = child_capture_id_opt.value();
+  begin_capture_state(conditional_graph_capture_ids_.top());
 
   conditional_node_streams_.emplace(child_stream);
 
@@ -618,17 +916,27 @@ void CUDAGraph::end_capture_to_conditional_node() {
     }
   }
 
-  {
-    std::unique_lock<std::mutex> lock(_currently_capturing_graphs_mutex);
-    TORCH_CHECK(
-        _currently_capturing_graphs.count(child_capture_id),
-        "capture_end() called before capture_begin().");
-    _currently_capturing_graphs.erase(child_capture_id);
+  CUDAStream stream = conditional_node_streams_.top().current_stream();
+  auto capture_end_state = begin_capture_end(child_capture_id);
+  std::exception_ptr child_capture_error = capture_end_state.error;
+  for (auto& epilogue : capture_end_state.epilogues) {
+    try {
+      epilogue(stream);
+    } catch (...) {
+      if (!child_capture_error) {
+        child_capture_error = std::current_exception();
+      }
+    }
   }
 
-  CUDAStream stream = conditional_node_streams_.top().current_stream();
-  AT_CUDA_CHECK(cudaStreamEndCapture(stream.stream(), nullptr));
+  cudaError_t endCaptureErr = cudaStreamEndCapture(stream.stream(), nullptr);
   c10::cuda::CUDACachingAllocator::markCaptureEnd(capture_dev_);
+
+  bool erased_capture = false;
+  {
+    std::unique_lock<std::mutex> lock(_currently_capturing_graphs_mutex);
+    erased_capture = _currently_capturing_graphs.erase(child_capture_id) == 1;
+  }
 
   c10::cuda::CUDACachingAllocator::endAllocateToPool(capture_dev_, mempool_id_);
   at::getHostAllocator(at::kCUDA)->end_allocate_to_pool(mempool_id_);
@@ -654,7 +962,27 @@ void CUDAGraph::end_capture_to_conditional_node() {
   }
   constexpr const char* rng_with_conditional_nodes_error =
       "RNG within data-dependent conditional nodes is not supported yet.";
-  TORCH_CHECK(!rng_or_generators_changed, rng_with_conditional_nodes_error);
+  if (!child_capture_error && endCaptureErr != cudaSuccess) {
+    try {
+      AT_CUDA_CHECK(endCaptureErr);
+    } catch (...) {
+      child_capture_error = std::current_exception();
+    }
+  }
+  if (!child_capture_error && rng_or_generators_changed) {
+    try {
+      TORCH_CHECK(false, rng_with_conditional_nodes_error);
+    } catch (...) {
+      child_capture_error = std::current_exception();
+    }
+  }
+  finish_capture_end(child_capture_id, endCaptureErr == cudaSuccess);
+  TORCH_INTERNAL_ASSERT(
+      erased_capture, "capture_end() called before capture_begin().");
+  if (child_capture_error) {
+    record_capture_error(capture_id_, child_capture_error);
+    std::rethrow_exception(child_capture_error);
+  }
 
 #else // !defined(USE_ROCM) && (defined(CUDA_VERSION) && CUDA_VERSION >= 12040)
   AT_ERROR(

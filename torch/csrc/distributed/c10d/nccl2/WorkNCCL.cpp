@@ -5,6 +5,7 @@
 #include <torch/csrc/distributed/c10d/nccl2/WorkNCCL.hpp>
 
 #include <ATen/core/ivalue.h>
+#include <ATen/cuda/CUDAGraph.h>
 #include <c10/core/DeviceGuard.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGraphsC10Utils.h>
@@ -20,6 +21,12 @@
 namespace c10d::nccl2 {
 
 namespace {
+#if defined(USE_ROCM) && ROCM_VERSION < 70000
+constexpr bool kSupportsExternalGraphEvents = false;
+#else
+constexpr bool kSupportsExternalGraphEvents = true;
+#endif
+
 std::atomic<uint64_t> nextCompletionKey{1};
 } // namespace
 
@@ -36,14 +43,35 @@ struct WorkNCCL::Events {
   Events& operator=(Events&&) = delete;
 
   ~Events() {
-    comm->returnEvent(std::move(start), timingEnabled);
-    comm->returnEvent(std::move(end), timingEnabled);
+    // A managed CUDA Graph may outlive its process group. Captured events are
+    // graph-owned and must not be returned through the process group's cache.
+    if (capturedEnd) {
+      return;
+    }
+    if (start) {
+      comm->returnEvent(std::move(start), timingEnabled);
+    }
+    if (end) {
+      comm->returnEvent(std::move(end), timingEnabled);
+    }
+  }
+
+  at::cuda::CUDAEvent& endEvent() {
+    return capturedEnd ? *capturedEnd : *end;
+  }
+
+  const at::cuda::CUDAEvent& endEvent() const {
+    return capturedEnd ? *capturedEnd : *end;
   }
 
   ProcessGroupNCCL* comm;
   bool timingEnabled;
   std::unique_ptr<at::cuda::CUDAEvent> start;
   std::unique_ptr<at::cuda::CUDAEvent> end;
+  std::shared_ptr<at::cuda::CUDAEvent> capturedEnd;
+  std::shared_ptr<at::cuda::CUDAEvent> externalEnd;
+  std::shared_ptr<std::atomic<bool>> capturedGraphLaunched;
+  std::optional<c10::cuda::CaptureId_t> producerCaptureId;
 };
 
 WorkNCCL::InputTensorShelf::InputTensorShelf(std::vector<at::Tensor> tensors)
@@ -127,7 +155,36 @@ void WorkNCCL::recordStart(std::string_view coll_name) {
 }
 
 void WorkNCCL::recordEnd() {
-  state_->events->end->record(state_->stream);
+  auto& events = *state_->events;
+  auto capture_id = c10::cuda::captureIdMayInitCtx(state_->stream);
+  auto* graph = capture_id.has_value()
+      ? at::cuda::get_graph_from_capture_id(*capture_id)
+      : nullptr;
+  if (kSupportsExternalGraphEvents && capture_id.has_value() && graph) {
+    events.capturedEnd =
+        std::shared_ptr<at::cuda::CUDAEvent>(events.end.release());
+    events.externalEnd = std::make_shared<at::cuda::CUDAEvent>(
+        cudaEventDisableTiming | cudaEventExternal);
+    events.capturedGraphLaunched = std::make_shared<std::atomic<bool>>(false);
+    events.producerCaptureId = capture_id;
+
+    graph->retain_capture_resource(*capture_id, state_->events);
+    graph->register_capture_epilogue(
+        *capture_id,
+        [end_event =
+             events.capturedEnd](const at::cuda::CUDAStream& capture_stream) {
+          end_event->block(capture_stream);
+        });
+    graph->register_capture_replay_callback(
+        *capture_id, [launched = events.capturedGraphLaunched]() {
+          launched->store(true, std::memory_order_release);
+        });
+
+    events.externalEnd->record(state_->stream);
+    events.capturedEnd->record(state_->stream);
+  } else {
+    events.end->record(state_->stream);
+  }
 
   if (recordFunction_ && recordFunction_->isActive()) {
     recordFunction_->end();
@@ -257,16 +314,28 @@ WorkNCCL::WorkStatus WorkNCCL::State::checkStatus(
   }
 
   if (current == WorkStatus::NOT_STARTED) {
-    try {
-      if (events->start->query()) {
+    if (events->externalEnd) {
+      // Internal events recorded into a CUDA Graph cannot be queried outside
+      // that graph. An external event also queries as complete before its
+      // graph's first replay, so wait for the graph's post-launch callback
+      // before using the event as evidence of progress or completion.
+      if (events->capturedGraphLaunched->load(std::memory_order_acquire)) {
         WorkStatus expected = WorkStatus::NOT_STARTED;
         workStatus.compare_exchange_strong(
             expected, WorkStatus::INPROGRESS, std::memory_order_relaxed);
       }
-    } catch (const std::exception& e) {
-      TC_LOG(ERROR, comm) << "CUDA error during start event query: "
-                          << e.what();
-      setTerminalStatus(WorkStatus::ERROR);
+    } else {
+      try {
+        if (events->start->query()) {
+          WorkStatus expected = WorkStatus::NOT_STARTED;
+          workStatus.compare_exchange_strong(
+              expected, WorkStatus::INPROGRESS, std::memory_order_relaxed);
+        }
+      } catch (const std::exception& e) {
+        TC_LOG(ERROR, comm)
+            << "CUDA error during start event query: " << e.what();
+        setTerminalStatus(WorkStatus::ERROR);
+      }
     }
   }
   if (status() == WorkStatus::ERROR) {
@@ -275,7 +344,9 @@ WorkNCCL::WorkStatus WorkNCCL::State::checkStatus(
 
   if (status() == WorkStatus::INPROGRESS) {
     try {
-      if (events->end->query()) {
+      const auto& completion_event =
+          events->externalEnd ? *events->externalEnd : events->endEvent();
+      if (completion_event.query()) {
         if (setTerminalStatus(WorkStatus::COMPLETED) &&
             ownedEphemeralTimeout.count() > 0 &&
             !ephemeralTimeoutReleased.exchange(true)) {
@@ -314,7 +385,17 @@ bool WorkNCCL::isSuccess() const {
 
 void WorkNCCL::synchronizeInternal() {
   WorkStatus local_state = status();
+  auto current_stream =
+      at::cuda::getCurrentCUDAStream(state_->stream.device_index());
+  auto current_capture_id = c10::cuda::captureIdMayInitCtx(current_stream);
   if (local_state == WorkStatus::COMPLETED) {
+    if (state_->events->externalEnd && current_capture_id.has_value()) {
+      if (auto* graph =
+              at::cuda::get_graph_from_capture_id(*current_capture_id)) {
+        graph->retain_capture_resource(*current_capture_id, state_->events);
+      }
+      state_->events->externalEnd->block(current_stream);
+    }
     inputTensors_->clear();
     return;
   }
@@ -331,9 +412,21 @@ void WorkNCCL::synchronizeInternal() {
 
   // Make the current stream wait for the end event recorded on the work's
   // stream, ordering subsequent current-stream ops after this collective.
-  auto current_stream =
-      at::cuda::getCurrentCUDAStream(state_->comm->getDevice().index());
-  state_->events->end->block(current_stream);
+  const bool crosses_capture = state_->events->externalEnd &&
+      state_->events->producerCaptureId.has_value() &&
+      (!current_capture_id.has_value() ||
+       *current_capture_id != *state_->events->producerCaptureId);
+  if (crosses_capture) {
+    if (current_capture_id.has_value()) {
+      if (auto* graph =
+              at::cuda::get_graph_from_capture_id(*current_capture_id)) {
+        graph->retain_capture_resource(*current_capture_id, state_->events);
+      }
+    }
+    state_->events->externalEnd->block(current_stream);
+  } else {
+    state_->events->endEvent().block(current_stream);
+  }
 
   // For a synchronous barrier, mirror stock ProcessGroupNCCL by host-blocking
   // the CPU thread until prior current-stream work has completed, not just
@@ -416,16 +509,18 @@ float WorkNCCL::State::getDuration() {
   TORCH_CHECK(
       timingEnabled,
       "getDuration only works if timing was enabled, see ProcessGroup::_enable_collectives_timing");
-  TORCH_CHECK(events->start && events->end, "getDuration requires CUDA events");
   TORCH_CHECK(
-      events->end->isCreated() && events->end->query(),
+      events->start && (events->end || events->capturedEnd),
+      "getDuration requires CUDA events");
+  TORCH_CHECK(
+      events->endEvent().isCreated() && events->endEvent().query(),
       "getDuration only works after the work has completed");
   std::shared_ptr<Events> start_events;
   {
     std::lock_guard<std::mutex> lock(durationMutex);
     start_events = durationStartEvents;
   }
-  return start_events->start->elapsed_time(*events->end);
+  return start_events->start->elapsed_time(events->endEvent());
 }
 
 uint64_t WorkNCCL::getSequencenumber() const {

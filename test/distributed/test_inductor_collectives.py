@@ -57,6 +57,7 @@ from torch.testing._internal.common_distributed import (
     requires_accelerator_dist_backend,
     requires_gloo,
     skip_if_lt_x_gpu,
+    skip_if_rocm_ver_lessthan_multiprocess,
 )
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
@@ -410,6 +411,36 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
                 for _ in range(3):
                     compiled_out = compiled_func(x)
                     self.assertEqual(golden_out, compiled_out)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
+    @skip_if_rocm_ver_lessthan_multiprocess([7, 0])
+    @skip_if_lt_x_gpu(2)
+    def test_allreduce_wait_across_cudagraph_break(self):
+        from torch._dynamo.utils import counters
+
+        with _dynamo_dist_per_rank_init(self.rank, self.world_size):
+            group_name = c10d.distributed_c10d._get_default_group().group_name
+
+            @torch.compile(mode="reduce-overhead")
+            def model(inp):
+                pending = torch.ops._c10d_functional.all_reduce.default(
+                    inp, "sum", group_name
+                )
+                torch._dynamo.graph_break()
+                waited = torch.ops._c10d_functional.wait_tensor.default(pending)
+                # Preserve a view of only part of the collective output across
+                # the graph break, as compiler partitioning commonly does.
+                return waited.view(4, 4)[:, :2]
+
+            skips_before = counters["inductor"]["cudagraph_skips"]
+            for offset in range(5):
+                inp = torch.full((16,), self.rank + offset + 1.0, device=self.device)
+                expected = sum(rank + offset + 1.0 for rank in range(self.world_size))
+                self.assertEqual(
+                    model(inp), torch.full((4, 2), expected, device=inp.device)
+                )
+
+            self.assertEqual(counters["inductor"]["cudagraph_skips"], skips_before)
 
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @skip_if_lt_x_gpu(2)

@@ -42,6 +42,12 @@ using FlightRecorderCUDA = FlightRecorder<at::cuda::CUDAEvent>;
 
 namespace {
 
+#if defined(USE_ROCM) && ROCM_VERSION < 70000
+constexpr bool kSupportsExternalGraphEvents = false;
+#else
+constexpr bool kSupportsExternalGraphEvents = true;
+#endif
+
 // NCCL op mapping
 const std::map<ReduceOp::RedOpType, ncclRedOp_t> ncclOp = {
     {ReduceOp::MIN, ncclMin},
@@ -598,6 +604,8 @@ ProcessGroupNCCL::WorkNCCL::WorkNCCL(const WorkNCCL& w)
       device_(w.device_),
       ncclStartEvent_(w.ncclStartEvent_),
       ncclEndEvent_(w.ncclEndEvent_),
+      ncclExternalEndEvent_(w.ncclExternalEndEvent_),
+      producerCaptureId_(w.producerCaptureId_),
       ncclComm_(w.ncclComm_),
       blockingWait_(w.blockingWait_),
       opTimeout_(w.opTimeout_),
@@ -828,10 +836,56 @@ void ProcessGroupNCCL::WorkNCCL::synchronize() {
 void ProcessGroupNCCL::WorkNCCL::synchronizeStream() {
   auto currentStream = at::cuda::getCurrentCUDAStream(device_.index());
   // Block the current stream on the NCCL stream
-  ncclEndEvent_->block(currentStream);
+  auto currentCaptureId = c10::cuda::captureIdMayInitCtx(currentStream);
+  const bool crossesCapture = ncclExternalEndEvent_ &&
+      producerCaptureId_.has_value() &&
+      (!currentCaptureId.has_value() ||
+       *currentCaptureId != *producerCaptureId_);
+  if (crossesCapture) {
+    if (currentCaptureId.has_value()) {
+      if (auto* graph =
+              at::cuda::get_graph_from_capture_id(*currentCaptureId)) {
+        graph->retain_capture_resource(
+            *currentCaptureId, ncclExternalEndEvent_);
+      }
+    }
+    ncclExternalEndEvent_->block(currentStream);
+  } else {
+    ncclEndEvent_->block(currentStream);
+  }
   // Unstage the stashed tensors so that CachingAllocator can recycle them
   // THIS MUST HAPPEN AFTER THE BLOCKING CALL ABOVE
   stashed_for_allocator_safety_->unstash();
+}
+
+void ProcessGroupNCCL::WorkNCCL::recordEndEvent(
+    const at::cuda::CUDAStream& ncclStream) {
+  auto captureId = c10::cuda::captureIdMayInitCtx(ncclStream);
+  auto* graph = captureId.has_value()
+      ? at::cuda::get_graph_from_capture_id(*captureId)
+      : nullptr;
+  if (!kSupportsExternalGraphEvents || !captureId.has_value() || !graph) {
+    ncclEndEvent_->record(ncclStream);
+    return;
+  }
+
+  ncclExternalEndEvent_ = std::make_shared<at::cuda::CUDAEvent>(
+      cudaEventDisableTiming | cudaEventExternal);
+  producerCaptureId_ = captureId;
+
+  graph->retain_capture_resource(*captureId, ncclExternalEndEvent_);
+  graph->retain_capture_resource(*captureId, ncclEndEvent_);
+  if (ncclStartEvent_) {
+    graph->retain_capture_resource(*captureId, ncclStartEvent_);
+  }
+  graph->register_capture_epilogue(
+      *captureId,
+      [endEvent = ncclEndEvent_](const at::cuda::CUDAStream& captureStream) {
+        endEvent->block(captureStream);
+      });
+
+  ncclExternalEndEvent_->record(ncclStream);
+  ncclEndEvent_->record(ncclStream);
 }
 
 // Same as calling synchronize() when blockingWait_ is false
@@ -3675,7 +3729,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::endCoalescing(OpType optype) {
   }
 
   // Record end after ncclGroupEnd
-  work->ncclEndEvent_->record(ncclStream);
+  work->recordEndEvent(ncclStream);
 
   if (enqueue) {
     workEnqueue(work);
@@ -3886,7 +3940,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::collective(
 
   // End event should only be recorded after the ncclGroupEnd()
   if (!coalescing_state_) {
-    work->ncclEndEvent_->record(ncclStream);
+    work->recordEndEvent(ncclStream);
   }
   work->ncclComm_ = ncclComm;
 
@@ -4062,7 +4116,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::collectiveCoalesced(
     }
   }
 
-  work->ncclEndEvent_->record(ncclStream);
+  work->recordEndEvent(ncclStream);
   work->ncclComm_ = ncclComm;
 
   {
@@ -4362,7 +4416,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::pointToPoint(
     post(ncclStream);
 
     // End event should only be recorded after the ncclGroupEnd()
-    work->ncclEndEvent_->record(ncclStream);
+    work->recordEndEvent(ncclStream);
     work->ncclComm_ = ncclComm;
     work->blockingWait_ = blockingWait_;
     work->store_ = store_;
