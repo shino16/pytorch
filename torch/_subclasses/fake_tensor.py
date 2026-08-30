@@ -2399,22 +2399,24 @@ class FakeTensorMode(TorchDispatchMode):
         if self.shape_env is not None:
             maybe_suppress = self.shape_env.suppress_guards
 
-        is_view = entry.view_idx is not None
-        view_arg = None
-        if is_view:
-            view_arg = args[cast(int, entry.view_idx)]
-            if not isinstance(view_arg, FakeTensor):  # noqa: ISINSTANCE_FAKE_TENSOR
+        view_idx = entry.view_idx
+        view_arg: FakeTensor | None = None
+        if view_idx is not None:
+            arg = args[view_idx]
+            if not isinstance(arg, FakeTensor):  # noqa: ISINSTANCE_FAKE_TENSOR
                 raise AssertionError("view_arg must be a FakeTensor")
-        view_dtype_matches = (
+            view_arg = arg
+
+        # A same-dtype view can be rebuilt directly as an as_strided of its
+        # input; as_strided can neither change dtype nor add autograd metadata.
+        if (
             view_arg is not None
             and metadata.dtype == view_arg.dtype
             and not metadata.requires_grad
-        )
-
-        with in_kernel_invocation_manager(self), maybe_suppress():
-            if view_dtype_matches:
-                view_base: Tensor = cast(FakeTensor, view_arg)
-                if view_base.requires_grad and not metadata.requires_grad:
+        ):
+            with in_kernel_invocation_manager(self), maybe_suppress():
+                view_base: Tensor = view_arg
+                if view_base.requires_grad:
                     view_base = view_base.detach()
                 empty = torch.as_strided(
                     view_base,
@@ -2422,7 +2424,13 @@ class FakeTensorMode(TorchDispatchMode):
                     stride,
                     storage_offset,
                 )
-            elif entry.is_canonical_contiguous:
+            torch._C._set_conj(empty, metadata.is_conj)
+            torch._C._set_neg(empty, metadata.is_neg)
+            return FakeTensor(self, empty, metadata.device)
+
+        is_view = view_arg is not None
+        with in_kernel_invocation_manager(self), maybe_suppress():
+            if entry.is_canonical_contiguous:
                 empty = torch.empty(
                     shape,
                     dtype=metadata.dtype,
@@ -2442,19 +2450,14 @@ class FakeTensorMode(TorchDispatchMode):
                     requires_grad=metadata.requires_grad,
                 )
 
-        if view_dtype_matches:
-            torch._C._set_conj(empty, metadata.is_conj)
-            torch._C._set_neg(empty, metadata.is_neg)
-        else:
-            if metadata.is_conj:
-                torch._C._set_conj(empty, True)
-            if metadata.is_neg:
-                torch._C._set_neg(empty, True)
+        if metadata.is_conj:
+            torch._C._set_conj(empty, True)
+        if metadata.is_neg:
+            torch._C._set_neg(empty, True)
 
-        if is_view and not view_dtype_matches:
+        if view_arg is not None:
             # For view ops, the storage should be the same as the tensor input.
-            view_base = cast(FakeTensor, view_arg)
-            storage = view_base.untyped_storage()
+            storage = view_arg.untyped_storage()
             with in_kernel_invocation_manager(self), maybe_suppress():
                 empty.set_(storage, storage_offset, shape, stride)
 
