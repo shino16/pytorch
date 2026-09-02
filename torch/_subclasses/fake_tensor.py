@@ -26,7 +26,7 @@ from torch._custom_class_base import CustomClassBase
 from torch._library.fake_class_registry import FakeScriptObject
 from torch._library.fake_profile import MissingOpProfile
 from torch._logging import dtrace_structured
-from torch._prims_common import suggest_memory_format
+from torch._prims_common import make_contiguous_strides_for, suggest_memory_format
 from torch._subclasses.meta_utils import (
     assert_eq,
     assert_metadata_eq,
@@ -1373,6 +1373,20 @@ class TensorMetadata:
                 result.append(value)
 
 
+def _same_int_expr(a: _MetadataIntLike, b: _MetadataIntLike) -> bool:
+    if isinstance(a, _SymIntOutputStub):
+        if not isinstance(b, _SymIntOutputStub):
+            return False
+        if isinstance(a.value, int):
+            return isinstance(b.value, int) and a.value == b.value
+        return not isinstance(b.value, int) and a.value._expr == b.value._expr
+    if isinstance(a, SymInt):
+        return isinstance(b, SymInt) and a.node.expr == b.node.expr
+    if isinstance(b, (_SymIntOutputStub, SymInt)):
+        return False
+    return a == b
+
+
 def extract_tensor_metadata(t: Tensor) -> TensorMetadata:
     """
     Extract the TensorMetadata of a tensor.
@@ -1380,15 +1394,17 @@ def extract_tensor_metadata(t: Tensor) -> TensorMetadata:
     # Read layout/sparseness once (hot-path Python properties on FakeTensor).
     layout = t.layout
     _is_sparse_any: bool = is_sparse_any(t)
-    memory_format = suggest_memory_format(t)
     # Don't call is_contiguous() on a Tensor which has symbolic sizes or things
-    # will go badly (guards will be messed up?)
-    if (
-        t._has_symbolic_sizes_strides
-        or _is_sparse_any
-        or not t.is_contiguous(memory_format=memory_format)
-    ):
-        memory_format = None  # type: ignore[assignment]
+    # will go badly (guards will be messed up?). suggest_memory_format walks
+    # sizes and strides, which is symbolic arithmetic for such a tensor, so
+    # skip it too rather than computing a value we are about to discard.
+    memory_format: torch.memory_format | None
+    if t._has_symbolic_sizes_strides or _is_sparse_any:
+        memory_format = None
+    else:
+        memory_format = suggest_memory_format(t)
+        if not t.is_contiguous(memory_format=memory_format):
+            memory_format = None
 
     storage_offset = t.storage_offset()
 
@@ -1463,6 +1479,7 @@ class _DispatchCacheEntryOutputInfo:
     inplace_idx: int | None
     metadata: TensorMetadata | None
     view_idx: int | None
+    is_canonical_contiguous: bool = False
     constant_value: Any | None = SingletonConstant
 
 
@@ -1839,7 +1856,7 @@ class FakeTensorMode(TorchDispatchMode):
 
             # We have a cache entry.
 
-            output = self._output_from_cache_entry(state, entry, key, func, args)
+            output = self._output_from_cache_entry(state, entry, key, args)
             FakeTensorMode.cache_hits += 1
             if self.cache_crosscheck_enabled:
                 # For debugging / testing: Validate that the output synthesized
@@ -1979,9 +1996,6 @@ class FakeTensorMode(TorchDispatchMode):
 
         if torch.Tag.inplace_view in func.tags:
             raise _BypassDispatchCache("inplace view")
-
-        if func is aten._unsafe_view.default:
-            raise _BypassDispatchCache("unsafe view")
 
         if func is torch.ops.prims.as_strided.default:
             raise _BypassDispatchCache("prims.as_strided")
@@ -2140,7 +2154,15 @@ class FakeTensorMode(TorchDispatchMode):
 
         # Otherwise, create an entry that records the output tensor's metadata.
         view_idx = None
-        if isinstance(func, torch._ops.OpOverload) and func.is_view:
+        # _unsafe_view is a view in every way that matters here: its output
+        # shares the input's storage. It is only "unsafe" in that it does not
+        # record the view for autograd. Treat it like one, so the output
+        # synthesized on a hit aliases its input as the real op would - caching
+        # it as a plain op would hand back a fresh storage and quietly lose the
+        # aliasing.
+        if isinstance(func, torch._ops.OpOverload) and (
+            func.is_view or func is aten._unsafe_view.default
+        ):
             idxs = [i for i, t in enumerate(args) if isinstance(t, Tensor)]
             if len(idxs) != 1:
                 raise AssertionError(
@@ -2149,19 +2171,45 @@ class FakeTensorMode(TorchDispatchMode):
             view_idx = idxs[0]
 
         metadata = extract_tensor_metadata(output)
-        metadata.shape = tuple(state.convert_output(v) for v in metadata.shape)
-        metadata.stride = tuple(state.convert_output(v) for v in metadata.stride)
-        metadata.storage_offset = state.convert_output(metadata.storage_offset)
+        shape = output.shape
+        stride = metadata.stride
+        storage_offset = metadata.storage_offset
+        metadata.shape = tuple(state.convert_output(v) for v in shape)
+        metadata.stride = tuple(state.convert_output(v) for v in stride)
+        metadata.storage_offset = state.convert_output(storage_offset)
         metadata.storage_bytes = (
             None
             if metadata.storage_bytes is None
             else state.convert_output(metadata.storage_bytes)
+        )
+        from torch.fx.experimental.symbolic_shapes import statically_known_true
+
+        # An int output-stub payload identifies an input SymNode. torch.empty
+        # would recompute the stride or offset and lose that node identity.
+        has_input_symnode_backref = any(
+            isinstance(value, _SymIntOutputStub) and isinstance(value.value, int)
+            for value in (*metadata.stride, metadata.storage_offset)
+        )
+        is_canonical_contiguous = (
+            view_idx is None
+            and metadata.layout == torch.strided
+            and statically_known_true(storage_offset == 0)
+            and not has_input_symnode_backref
+            and all(
+                _same_int_expr(actual, state.convert_output(expected))
+                for actual, expected in zip(
+                    metadata.stride,
+                    make_contiguous_strides_for(shape),
+                    strict=True,
+                )
+            )
         )
 
         entry = _DispatchCacheEntryOutputInfo(
             inplace_idx=None,
             metadata=metadata,
             view_idx=view_idx,
+            is_canonical_contiguous=is_canonical_contiguous,
         )
 
         # N.B.: Some checks for bypassing the cache would be performed on the
@@ -2176,7 +2224,7 @@ class FakeTensorMode(TorchDispatchMode):
 
         try:
             synth_output = self._output_from_cache_entry(
-                state, entry_for_synth_output, key, func, args
+                state, entry_for_synth_output, key, args
             )
         except GuardOnDataDependentSymNode:
             # This should probably never really happen. If it does it means that
@@ -2306,7 +2354,6 @@ class FakeTensorMode(TorchDispatchMode):
         state: _CacheKeyState,
         entry: _DispatchCacheEntryOutputInfo,
         key: _DispatchCacheKey,
-        func: OpOverload,
         args: Sequence[object],
     ) -> FakeTensor | None:
         if (
@@ -2358,26 +2405,64 @@ class FakeTensorMode(TorchDispatchMode):
         if self.shape_env is not None:
             maybe_suppress = self.shape_env.suppress_guards
 
+        view_idx = entry.view_idx
+        view_arg: FakeTensor | None = None
+        if view_idx is not None:
+            arg = args[view_idx]
+            if not isinstance(arg, FakeTensor):  # noqa: ISINSTANCE_FAKE_TENSOR
+                raise AssertionError("view_arg must be a FakeTensor")
+            view_arg = arg
+
+        # Rebuild same-dtype views that should not require gradients directly
+        # with as_strided. Detach a grad-requiring base to match the metadata.
+        if (
+            view_arg is not None
+            and metadata.dtype == view_arg.dtype
+            and not metadata.requires_grad
+        ):
+            with in_kernel_invocation_manager(self), maybe_suppress():
+                view_base: Tensor = view_arg
+                if view_base.requires_grad:
+                    view_base = view_base.detach()
+                empty = torch.as_strided(
+                    view_base,
+                    shape,
+                    stride,
+                    storage_offset,
+                )
+            torch._C._set_conj(empty, metadata.is_conj)
+            torch._C._set_neg(empty, metadata.is_neg)
+            return FakeTensor(self, empty, metadata.device)
+
+        is_view = view_arg is not None
         with in_kernel_invocation_manager(self), maybe_suppress():
-            empty = torch.empty_strided(
-                shape,
-                stride,
-                dtype=metadata.dtype,
-                layout=metadata.layout,
-                device="meta",
-                requires_grad=metadata.requires_grad,
-            )
+            if entry.is_canonical_contiguous:
+                empty = torch.empty(
+                    shape,
+                    dtype=metadata.dtype,
+                    layout=metadata.layout,
+                    device="meta",
+                    requires_grad=metadata.requires_grad,
+                )
+            else:
+                # The set_ below replaces these fields for view outputs, so do
+                # not derive their symbolic metadata twice on the fallback path.
+                empty = torch.empty_strided(
+                    () if is_view else shape,
+                    () if is_view else stride,
+                    dtype=metadata.dtype,
+                    layout=metadata.layout,
+                    device="meta",
+                    requires_grad=metadata.requires_grad,
+                )
 
         if metadata.is_conj:
             torch._C._set_conj(empty, True)
         if metadata.is_neg:
             torch._C._set_neg(empty, True)
 
-        if isinstance(func, torch._ops.OpOverload) and func.is_view:
+        if view_arg is not None:
             # For view ops, the storage should be the same as the tensor input.
-            view_arg = args[cast(int, entry.view_idx)]
-            if not isinstance(view_arg, FakeTensor):  # noqa: ISINSTANCE_FAKE_TENSOR
-                raise AssertionError("view_arg must be a FakeTensor")
             storage = view_arg.untyped_storage()
             with in_kernel_invocation_manager(self), maybe_suppress():
                 empty.set_(storage, storage_offset, shape, stride)
@@ -2389,7 +2474,6 @@ class FakeTensorMode(TorchDispatchMode):
         state: _CacheKeyState,
         entry: _DispatchCacheValidEntry,
         key: _DispatchCacheKey,
-        func: OpOverload,
         args: Sequence[object],
     ) -> FakeTensor | None | tuple[FakeTensor | None, ...]:
         """
@@ -2398,15 +2482,13 @@ class FakeTensorMode(TorchDispatchMode):
 
         if entry.is_output_tuple:
             outputs = [
-                self._get_output_tensor_from_cache_entry(
-                    state, output_info, key, func, args
-                )
+                self._get_output_tensor_from_cache_entry(state, output_info, key, args)
                 for output_info in entry.output_infos
             ]
             return tuple(outputs)
         else:
             return self._get_output_tensor_from_cache_entry(
-                state, entry.output_infos[0], key, func, args
+                state, entry.output_infos[0], key, args
             )
 
     def _crosscheck_cache_output(
