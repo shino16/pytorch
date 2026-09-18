@@ -75,6 +75,24 @@ def _default_and_inlined_loaders(code: str, cache: bytes, backend: str):
 @skipIfTorchDynamo("precompile's make_fx capture is incompatible with dynamo wrapping")
 @instantiate_parametrized_tests
 class TestPrecompile(TestCase):
+    def test_guard_fact_pickle_and_hash(self):
+        from torch.compiler._precompile_types import GuardFact
+
+        # A fact is a value: pickle round-trips it and equal facts hash equal.
+        fact = GuardFact(
+            guard_type="ID_MATCH",
+            source="G['fn']",
+            code=("___check_obj_id(G['fn'], <id>), type=<class 'function'>",),
+            value="is @m.py:3#abc mod.fn",
+            enforced=False,
+        )
+        clone = pickle.loads(pickle.dumps(fact))
+        self.assertEqual(clone, fact)
+        self.assertEqual(hash(clone), hash(fact))
+        # Keyword-only: three str fields in a row would otherwise transpose silently.
+        with self.assertRaisesRegex(TypeError, "takes 1 positional argument"):
+            GuardFact("ID_MATCH", "G['fn']", (), "is @m.py:3#abc mod.fn", False)
+
     def test_decompositions_kwarg(self):
         # The decompositions table is threaded into make_fx during capture; a
         # custom decomposition is invoked and the result still matches eager.
@@ -174,14 +192,8 @@ class TestPrecompile(TestCase):
         torch.cuda.is_available(), "needs CUDA + Triton for the kernel cache"
     )
     @torch._inductor.config.patch({"compile_threads": 1})
-    def test_cache_primes_inductor_on_reload(self):
-        # The cache is a pure acceleration. load() feeds it to load_cache_artifacts to
-        # PRIME the inductor kernel caches, then execs the self-contained python_code --
-        # which loads the precompiled Triton kernels instead of recompiling. The composed
-        # python_code runs its inlined kernels directly (no compile_fx re-entry, so no
-        # FxGraphCache lookup); the observable acceleration is the Triton bundler
-        # rehydrating the static autotuner on the cold reload. Mirrors
-        # test/inductor/test_compile_to_python.py test_warm_load_rehydrates_static_launcher.
+    def test_cache_reload_without_eager_static_launcher_rehydration(self):
+        # A cold load should use JIT instead of eagerly rehydrating the static launcher.
         import torch._inductor.config as ind_config
 
         if ind_config.force_disable_caches or not ind_config.fx_graph_cache:
@@ -206,7 +218,7 @@ class TestPrecompile(TestCase):
             counters.clear()
             f_c = torch.compiler.precompile.load(code, cache)
             self.assertEqual(f_c(m, x), m(x))
-            self.assertGreater(
+            self.assertEqual(
                 counters["inductor"]["triton_bundler_load_static_autotuner"], 0
             )
 
