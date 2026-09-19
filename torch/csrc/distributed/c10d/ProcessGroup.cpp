@@ -571,6 +571,16 @@ bool allow_inflight_collective_as_graph_input() {
       .allow_inflight_collective_as_graph_input();
 }
 
+static thread_local bool allow_collective_wait_outside_capture_ = false;
+
+bool allow_collective_wait_outside_capture() {
+  return allow_collective_wait_outside_capture_;
+}
+
+bool set_allow_collective_wait_outside_capture(bool value) {
+  return std::exchange(allow_collective_wait_outside_capture_, value);
+}
+
 c10::intrusive_ptr<ProcessGroup>& currentProcessGroup() {
   thread_local static c10::intrusive_ptr<ProcessGroup> pg = nullptr;
   return pg;

@@ -845,7 +845,8 @@ void ProcessGroupNCCL::WorkNCCL::recordEndEvent(
     bool asyncOp,
     c10::cuda::CaptureStatus captureStatus) {
   ncclEndEvent_->record(stream);
-  if (asyncOp && captureStatus == c10::cuda::CaptureStatus::Active) {
+  if (asyncOp && captureStatus == c10::cuda::CaptureStatus::Active &&
+      c10d::allow_collective_wait_outside_capture()) {
 #ifdef USE_ROCM
     captureId_ = c10::cuda::captureInfoMayInitCtx(stream).id;
 #else

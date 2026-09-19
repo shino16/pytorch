@@ -12045,6 +12045,11 @@ class OpaqueObjectState(NonTensorObj):
 
 
 class _CollectiveKernel(FallbackKernel):
+    # Set after scheduling, once the producer's capture region is known.
+    allow_external_wait: bool = False
+    # Tensors registered with WorkRegistry, excluding read-only input aliases.
+    waitable_outputs: Sequence[IRNode] | None = None
+
     def should_allocate(self) -> bool:
         return False
 
@@ -12109,6 +12114,7 @@ class _CollectiveKernel(FallbackKernel):
         )
 
         inps = pytree.tree_leaves(inputs)
+        packed.waitable_outputs = [kwargs["out"]] if "out" in kwargs else inps
         packed.mutation_outputs.extend(
             [MutationOutput(NoneLayout(device=device), buf, packed) for buf in inps]
         )
@@ -12183,6 +12189,7 @@ class _CollectiveKernel(FallbackKernel):
                 )
                 for i, tensor in enumerate(example_output)
             ]
+            packed.waitable_outputs = packed.outputs
             for buf, tensor in zip(packed.outputs, example_output):
                 if config.assume_unaligned_fallback_output or not tensor_is_aligned(
                     tensor
@@ -12202,6 +12209,9 @@ class _CollectiveKernel(FallbackKernel):
             ):
                 V.graph.unaligned_buffers.add(packed.name)  # type: ignore[arg-type]
             packed.outputs = [packed]
+            # DTensor's shard redistribution waits internally and registers no Work.
+            if kernel != torch.ops._dtensor.shard_dim_alltoall.default:
+                packed.waitable_outputs = packed.outputs
             return packed
 
 

@@ -55,6 +55,11 @@ C10_EXPORT void set_allow_inflight_collective_as_graph_input(bool value);
 
 C10_EXPORT bool allow_inflight_collective_as_graph_input();
 
+// Scoped to collective launches on this thread. Inductor enables this only
+// when a collective's wait is outside the producer's CUDA graph capture.
+C10_EXPORT bool allow_collective_wait_outside_capture();
+C10_EXPORT bool set_allow_collective_wait_outside_capture(bool value);
+
 // ProcessGroup is a base class that captures collective and point to
 // point communication in a fixed set of processes.
 //

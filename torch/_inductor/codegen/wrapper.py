@@ -720,7 +720,15 @@ class ExternKernelAllocLine(WrapperLine):
     def codegen(self, code: IndentedBuffer) -> None:
         node = self.node
         args = [*node.codegen_args(), *node.codegen_kwargs()]
-        self.wrapper._generate_extern_kernel_alloc_helper(self.node, args)
+        if isinstance(node, ir._CollectiveKernel) and node.allow_external_wait:
+            code.writeline(
+                "with torch.distributed._functional_collectives."
+                "_allow_collective_wait_outside_capture():"
+            )
+            with code.indent():
+                self.wrapper._generate_extern_kernel_alloc_helper(node, args)
+        else:
+            self.wrapper._generate_extern_kernel_alloc_helper(node, args)
 
     def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
         return converter._generate_extern_kernel_alloc

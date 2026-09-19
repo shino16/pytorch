@@ -1152,6 +1152,11 @@ Example:
   });
 
   module.def(
+      "_set_allow_collective_wait_outside_capture",
+      &::c10d::set_allow_collective_wait_outside_capture,
+      py::arg("value"));
+
+  module.def(
       "_set_allow_inflight_collective_as_graph_input",
       [](bool value) {
         return ::c10d::set_allow_inflight_collective_as_graph_input(value);

@@ -11986,7 +11986,7 @@ class Scheduler:
                     )
 
                 if signature.skip_cudagraph:
-                    self._codegen(partition)
+                    self._codegen(partition, skip_cudagraph=True)
                 else:
                     self._codegen_partition_wrapper(partition, signature)
 
@@ -12002,7 +12002,57 @@ class Scheduler:
                     f"Expect {num_partitions} partition maps but got {len(V.graph.partition_maps)}"
                 )
 
-    def _codegen(self, nodes: list[BaseSchedulerNode]) -> None:
+    def mark_collective_external_waits(self, nodes: list[BaseSchedulerNode]) -> None:
+        from .graph import SubgraphLowering
+
+        if not config.triton.cudagraphs:
+            return
+
+        # Use actual wait operands, not scheduling dependencies: an out-of-place
+        # wait also reads the collective's input without waiting on its work.
+        waited: OrderedSet[str] = OrderedSet()
+        for snode in reversed(nodes):
+            for leaf in reversed(snode.get_nodes()):
+                node = leaf.node
+                if isinstance(node, ir._WaitKernel):
+                    for inp in pytree.tree_leaves(node.inputs):
+                        if isinstance(inp, ir.IRNode):
+                            waited.add(inp.get_name())
+                elif isinstance(node, ir._CollectiveKernel):
+                    device = node.get_device()
+                    if (
+                        device is None
+                        or device.type != "cuda"
+                        or node.waitable_outputs is None
+                        or node.op_overload
+                        in (
+                            torch.ops._c10d_functional.isend.default,
+                            torch.ops._c10d_functional.irecv.default,
+                        )
+                    ):
+                        continue
+                    outputs = OrderedSet(
+                        out.get_name() for out in node.waitable_outputs
+                    )
+                    node.allow_external_wait = not outputs or not outputs.issubset(
+                        waited
+                    )
+                    if node.allow_external_wait and (
+                        V.graph.cpp_wrapper
+                        or V.graph.fx_wrapper
+                        or isinstance(V.graph, SubgraphLowering)
+                    ):
+                        raise NotImplementedError(
+                            "Cross-capture collective waits require a top-level "
+                            "Inductor Python wrapper; subgraphs and "
+                            "C++/FX wrappers are not supported."
+                        )
+
+    def _codegen(
+        self, nodes: list[BaseSchedulerNode], *, skip_cudagraph: bool = False
+    ) -> None:
+        if not skip_cudagraph:
+            self.mark_collective_external_waits(nodes)
         if config.check_stack_no_cycles_TESTING_ONLY:
             import torch._dynamo.convert_frame
 
