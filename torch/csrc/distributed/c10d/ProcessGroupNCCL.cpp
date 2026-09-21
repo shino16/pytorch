@@ -882,8 +882,9 @@ void end_collective_capture(bool success) {
   }
   auto info = c10::cuda::captureInfoMayInitCtx(capture.origin);
   TORCH_CHECK(
-      info.status == capture.info.status && info.id == capture.info.id &&
-          info.graph == capture.info.graph,
+      info.status == capture.info.status &&
+          (info.status == c10::cuda::CaptureStatus::None ||
+           (info.id == capture.info.id && info.graph == capture.info.graph)),
       "Collective capture changed before finalization");
 
   // Do not consume the registry: the scheduled wait still owns that operation.
@@ -957,12 +958,14 @@ void ProcessGroupNCCL::WorkNCCL::recordEndEvent(
     auto& capture = collectiveCaptures.back();
     TORCH_CHECK(
         captureStatus == capture.info.status && info.status == captureStatus &&
-            info.id == capture.info.id && info.graph == capture.info.graph,
+            (info.status == c10::cuda::CaptureStatus::None ||
+             (info.id == capture.info.id && info.graph == capture.info.graph)),
         "Collectives in nested captures require their own capture scope");
     // CUDA owns the returned array and can invalidate it on the next stream
     // operation. Copy the handles now, while this Work is the stream frontier.
     std::vector<cudaGraphNode_t> frontier;
-    if (count) {
+    // Capture ID, graph, and dependencies are only valid during capture.
+    if (info.status == c10::cuda::CaptureStatus::Active && count) {
       frontier.assign(dependencies, dependencies + count);
     }
     capturedCollective_ = std::make_shared<CapturedCollective>(
