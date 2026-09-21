@@ -1575,6 +1575,11 @@ Example:
           py::arg("count") = 1);
 
 #ifdef USE_C10D_NCCL
+  module.def("_begin_collective_capture", &::c10d::begin_collective_capture);
+  module.def("_end_collective_capture", &::c10d::end_collective_capture);
+  module.def(
+      "_set_collective_capture_enabled",
+      &::c10d::set_collective_capture_enabled);
 #ifdef NCCL_HAS_SYMMEM_DEVICE_SUPPORT
   // Publish an externally-owned host ncclComm_t (passed as an opaque integer
   // pointer) into the per-device NCCLDevCommManager under `group_name`, so

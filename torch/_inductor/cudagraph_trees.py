@@ -81,13 +81,13 @@ from torch._inductor.cudagraph_utils import (
     check_for_mutation,
     CheckInvariantStatus,
     collect_cuda_data_ptrs,
+    DeferredCollectiveCapture,
     FunctionID,
     log_cudagraph_skip_and_bump_counter,
     log_data_ptr_mismatch,
     maybe_warning_due_to_dynamic_shape,
     ModelType,
     OutputType,
-    PendingCollectiveWaits,
     PlaceholderInfo,
     WrappedFunction,
 )
@@ -1506,10 +1506,9 @@ class CUDAGraphNode:
             _update_current_stream_external_object(),
             CUDAGraphCaptureControlFlowOpDispatchMode(),
             get_history_recording(),
-            PendingCollectiveWaits() as collectives,
+            DeferredCollectiveCapture(),
         ):
             static_outputs = model(inputs)
-            collectives.wait()
 
         # running model should reclaim memory
         if len(inputs) != 0:

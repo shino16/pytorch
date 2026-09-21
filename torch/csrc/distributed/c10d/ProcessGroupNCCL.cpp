@@ -7,6 +7,8 @@
 #include <mutex>
 #include <stdexcept>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include <ATen/cuda/CUDAGraph.h>
@@ -40,7 +42,36 @@ namespace c10d {
 constexpr const char* const kNCCLAbortedCommStoreKey = "NCCLABORTEDCOMM";
 using FlightRecorderCUDA = FlightRecorder<at::cuda::CUDAEvent>;
 
+struct CapturedCollective {
+  ProcessGroupNCCL::WorkNCCL* work;
+  at::cuda::CUDAStream stream;
+  std::vector<cudaGraphNode_t> dependencies;
+};
+
 namespace {
+
+struct CollectiveCapture {
+  c10::cuda::CaptureInfo info;
+  at::cuda::CUDAStream origin;
+  bool previousEnabled;
+  std::vector<std::weak_ptr<CapturedCollective>> collectives;
+};
+
+thread_local std::vector<CollectiveCapture> collectiveCaptures;
+thread_local bool collectiveCaptureEnabled = false;
+
+void retainCapturedEvent(
+    cudaGraph_t graph,
+    const std::shared_ptr<at::cuda::CUDAEvent>& event) {
+  // These events come from CUDAEventCache: releasing them only returns them to
+  // the cache. CUDA user-object destructors must not call CUDA APIs.
+  c10::cuda::retainGraphUserObject(
+      graph,
+      std::make_unique<std::shared_ptr<at::cuda::CUDAEvent>>(event),
+      [](void* data) {
+        delete static_cast<std::shared_ptr<at::cuda::CUDAEvent>*>(data);
+      });
+}
 
 // NCCL op mapping
 const std::map<ReduceOp::RedOpType, ncclRedOp_t> ncclOp = {
@@ -598,6 +629,8 @@ ProcessGroupNCCL::WorkNCCL::WorkNCCL(const WorkNCCL& w)
       device_(w.device_),
       ncclStartEvent_(w.ncclStartEvent_),
       ncclEndEvent_(w.ncclEndEvent_),
+      capturedEndEvent_(w.capturedEndEvent_),
+      captureId_(w.captureId_),
       ncclComm_(w.ncclComm_),
       blockingWait_(w.blockingWait_),
       opTimeout_(w.opTimeout_),
@@ -705,7 +738,7 @@ bool ProcessGroupNCCL::WorkNCCL::finishedGPUExecutionInternal() const {
 #if defined(USE_ROCM) && ROCM_VERSION < 70201
   if (!queryEventWithRocmWatchdogCaptureWorkaround(ncclEndEvent_)) {
 #else
-  if (!ncclEndEvent_->query()) {
+  if (!(capturedEndEvent_ ? capturedEndEvent_ : ncclEndEvent_)->query()) {
 #endif
     return false;
   }
@@ -825,10 +858,176 @@ void ProcessGroupNCCL::WorkNCCL::synchronize() {
   }
 }
 
+void begin_collective_capture() {
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto info = c10::cuda::captureInfoMayInitCtx(stream);
+  TORCH_CHECK(
+      info.status != c10::cuda::CaptureStatus::Invalidated,
+      "Cannot track collectives in an invalidated CUDA graph capture");
+  collectiveCaptures.push_back({info, stream, collectiveCaptureEnabled, {}});
+  collectiveCaptureEnabled = true;
+}
+
+bool set_collective_capture_enabled(bool enabled) {
+  return std::exchange(collectiveCaptureEnabled, enabled);
+}
+
+void end_collective_capture(bool success) {
+  TORCH_CHECK(!collectiveCaptures.empty(), "No collective capture to finalize");
+  auto capture = std::move(collectiveCaptures.back());
+  collectiveCaptures.pop_back();
+  collectiveCaptureEnabled = capture.previousEnabled;
+  if (!success) {
+    return;
+  }
+  auto info = c10::cuda::captureInfoMayInitCtx(capture.origin);
+  TORCH_CHECK(
+      info.status == capture.info.status && info.id == capture.info.id &&
+          info.graph == capture.info.graph,
+      "Collective capture changed before finalization");
+
+  // Do not consume the registry: the scheduled wait still owns that operation.
+  // In particular, a partial wait on coalesced outputs leaves Work registered.
+  std::unordered_set<Work*> pending;
+  auto registered = c10d::registered_works();
+  for (const auto& work : registered) {
+    pending.insert(work.get());
+  }
+  std::unordered_map<at::cuda::CUDAStream, std::vector<cudaGraphNode_t>>
+      exports;
+  for (const auto& snapshot : capture.collectives) {
+    auto collective = snapshot.lock();
+    // The registry snapshot owns Work during finalization. Expired snapshots
+    // also distinguish a destroyed Work from a new Work reusing its address.
+    if (collective && pending.erase(collective->work)) {
+      if (info.status == c10::cuda::CaptureStatus::None) {
+        // Legacy warmup discards its outputs. Consume only Work launched in
+        // this scope, including direct C++ wrapper calls and coalesced aliases.
+        collective->work->wait();
+        c10d::unregister_work(
+            c10::intrusive_ptr<ProcessGroupNCCL::WorkNCCL>::
+                unsafe_reclaim_from_nonowning(collective->work));
+        continue;
+      }
+      auto node = collective->work->exportCapturedEvent(
+          collective->stream, info, collective->dependencies);
+      exports[collective->stream].push_back(node);
+    }
+  }
+#ifndef USE_ROCM
+  // Export records refer to historical completion points. Seal the CURRENT
+  // frontier separately, otherwise exporting an earlier Work could discard
+  // dependencies on communication launched after it. No origin-stream wait is
+  // inserted; these directly added nodes exempt the side stream from the
+  // capture join requirement.
+  const at::cuda::CUDAGuard guard(capture.origin.device_index());
+  for (auto& [stream, nodes] : exports) {
+    const cudaGraphNode_t* dependencies = nullptr;
+    size_t count = 0;
+    auto terminal =
+        c10::cuda::captureInfoMayInitCtx(stream, &dependencies, &count);
+    TORCH_CHECK(
+        terminal.status == c10::cuda::CaptureStatus::Active &&
+            terminal.id == info.id && terminal.graph == info.graph,
+        "NCCL stream left its collective capture");
+    for (size_t i = 0; i < count; ++i) {
+      if (std::find(nodes.begin(), nodes.end(), dependencies[i]) ==
+          nodes.end()) {
+        nodes.push_back(dependencies[i]);
+      }
+    }
+    cudaGraphNode_t terminalNode{};
+    C10_CUDA_CHECK(cudaGraphAddEmptyNode(
+        &terminalNode, info.graph, nodes.data(), nodes.size()));
+    c10::cuda::setCaptureDependencies(stream, &terminalNode, 1);
+  }
+#endif
+}
+
+void ProcessGroupNCCL::WorkNCCL::recordEndEvent(
+    const at::cuda::CUDAStream& stream,
+    bool asyncOp,
+    c10::cuda::CaptureStatus captureStatus) {
+  ncclEndEvent_->record(stream);
+  if (asyncOp && !isP2P_ && collectiveCaptureEnabled &&
+      !collectiveCaptures.empty()) {
+    const cudaGraphNode_t* dependencies = nullptr;
+    size_t count = 0;
+    auto info = c10::cuda::captureInfoMayInitCtx(stream, &dependencies, &count);
+    auto& capture = collectiveCaptures.back();
+    TORCH_CHECK(
+        captureStatus == capture.info.status && info.status == captureStatus &&
+            info.id == capture.info.id && info.graph == capture.info.graph,
+        "Collectives in nested captures require their own capture scope");
+    // CUDA owns the returned array and can invalidate it on the next stream
+    // operation. Copy the handles now, while this Work is the stream frontier.
+    std::vector<cudaGraphNode_t> frontier;
+    if (count) {
+      frontier.assign(dependencies, dependencies + count);
+    }
+    capturedCollective_ = std::make_shared<CapturedCollective>(
+        CapturedCollective{this, stream, std::move(frontier)});
+    capture.collectives.push_back(capturedCollective_);
+  }
+}
+
+cudaGraphNode_t ProcessGroupNCCL::WorkNCCL::exportCapturedEvent(
+    const at::cuda::CUDAStream& stream,
+    const c10::cuda::CaptureInfo& info,
+    const std::vector<cudaGraphNode_t>& dependencies) {
+#ifdef USE_ROCM
+  TORCH_CHECK_NOT_IMPLEMENTED(
+      false,
+      "Waiting on captured collective work outside its original capture "
+      "is not supported on ROCm.");
+#else
+  const at::cuda::CUDAGuard guard(stream.device_index());
+  capturedEndEvent_ = CUDAEventCache::get(device_.index())->create(false, true);
+  captureId_ = info.id;
+  retainCapturedEvent(info.graph, capturedEndEvent_);
+  capturedEndEvent_->create(stream.device_index());
+  cudaGraphNode_t node{};
+  C10_CUDA_CHECK(cudaGraphAddEventRecordNode(
+      &node,
+      info.graph,
+      dependencies.data(),
+      dependencies.size(),
+      capturedEndEvent_->event()));
+  const auto* interp = c10::impl::GPUTrace::get_trace();
+  if (C10_UNLIKELY(interp)) {
+    (*interp)->trace_gpu_event_record(
+        c10::kCUDA,
+        reinterpret_cast<uintptr_t>(capturedEndEvent_->event()),
+        reinterpret_cast<uintptr_t>(stream.stream()));
+  }
+  return node;
+#endif
+}
+
 void ProcessGroupNCCL::WorkNCCL::synchronizeStream() {
   auto currentStream = at::cuda::getCurrentCUDAStream(device_.index());
   // Block the current stream on the NCCL stream
-  ncclEndEvent_->block(currentStream);
+  if (captureId_) {
+    auto info = c10::cuda::captureInfoMayInitCtx(currentStream);
+    if (info.status == c10::cuda::CaptureStatus::Active &&
+        info.id == *captureId_) {
+      ncclEndEvent_->block(currentStream);
+    } else {
+#ifdef USE_ROCM
+      TORCH_CHECK_NOT_IMPLEMENTED(
+          false,
+          "Waiting on captured collective work outside its original capture "
+          "is not supported on ROCm.");
+#else
+      if (info.status == c10::cuda::CaptureStatus::Active) {
+        retainCapturedEvent(info.graph, capturedEndEvent_);
+      }
+      capturedEndEvent_->block(currentStream);
+#endif
+    }
+  } else {
+    ncclEndEvent_->block(currentStream);
+  }
   // Unstage the stashed tensors so that CachingAllocator can recycle them
   // THIS MUST HAPPEN AFTER THE BLOCKING CALL ABOVE
   stashed_for_allocator_safety_->unstash();
@@ -3684,7 +3883,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::endCoalescing(OpType optype) {
   }
 
   // Record end after ncclGroupEnd
-  work->ncclEndEvent_->record(ncclStream);
+  work->recordEndEvent(ncclStream, coalescedAsync_, capture_status);
 
   if (enqueue) {
     workEnqueue(work);
@@ -3895,7 +4094,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::collective(
 
   // End event should only be recorded after the ncclGroupEnd()
   if (!coalescing_state_) {
-    work->ncclEndEvent_->record(ncclStream);
+    work->recordEndEvent(ncclStream, asyncOp, capture_status);
   }
   work->ncclComm_ = ncclComm;
 
@@ -4071,7 +4270,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::collectiveCoalesced(
     }
   }
 
-  work->ncclEndEvent_->record(ncclStream);
+  work->recordEndEvent(ncclStream, asyncOp, capture_status);
   work->ncclComm_ = ncclComm;
 
   {

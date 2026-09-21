@@ -38,12 +38,19 @@
 #include <c10/core/Stream.h>
 #include <c10/core/StreamGuard.h>
 #include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 
 #include <torch/custom_class.h>
 
 namespace c10d {
+
+struct CapturedCollective;
+
+TORCH_API void begin_collective_capture();
+TORCH_API void end_collective_capture(bool success);
+TORCH_API bool set_collective_capture_enabled(bool enabled);
 
 // Control broadcasting of NCCL uniqueId
 static std::vector<std::string> TORCH_NCCL_BCAST_UNIQUEID = {
@@ -365,6 +372,16 @@ class TORCH_API ProcessGroupNCCL : public Backend {
     // Synchronize streams by blocking each on the NCCL stream
     void synchronizeStream();
 
+    void recordEndEvent(
+        const at::cuda::CUDAStream& stream,
+        bool asyncOp,
+        c10::cuda::CaptureStatus captureStatus);
+
+    cudaGraphNode_t exportCapturedEvent(
+        const at::cuda::CUDAStream& stream,
+        const c10::cuda::CaptureInfo& info,
+        const std::vector<cudaGraphNode_t>& dependencies);
+
     // Helper function to handle exception (throw if needed).
     void handleException(ErrorHandlingMode asyncErrorHandling);
 
@@ -421,6 +438,17 @@ class TORCH_API ProcessGroupNCCL : public Backend {
 
     // The end CUDA event of NCCL operator tracking this work item.
     std::shared_ptr<at::cuda::CUDAEvent> ncclEndEvent_;
+
+    // Capture scopes hold this snapshot weakly so already-waited Work and its
+    // output tensors can be released at their original last-use positions.
+    std::shared_ptr<CapturedCollective> capturedCollective_;
+
+    // The external completion event for waits outside the original capture.
+    // Recording and waiting graphs retain it independently of this work item.
+    std::shared_ptr<at::cuda::CUDAEvent> capturedEndEvent_;
+
+    // The original capture ID for captured async work; unset for other work.
+    std::optional<c10::cuda::CaptureId_t> captureId_;
 
     // The NCCL communicator used for this work item.
     std::shared_ptr<NCCLComm> ncclComm_;

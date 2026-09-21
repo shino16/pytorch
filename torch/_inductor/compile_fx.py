@@ -67,9 +67,9 @@ from torch._inductor.cudagraph_utils import (
     BoxedDeviceIndex,
     cudagraph_trees_clone_live_user_visible_outputs,
     cudagraphs_log,
+    DeferredCollectiveCapture,
     format_default_skip_message,
     log_cudagraph_skip_and_bump_counter,
-    PendingCollectiveWaits,
     PlaceholderInfo,
 )
 from torch._inductor.custom_graph_pass import CustomPartitionerFn
@@ -2338,9 +2338,8 @@ def cudagraphify_impl(
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     # copy static_inputs because it will be cleared in model
-    with torch.cuda.stream(stream), PendingCollectiveWaits() as collectives:
+    with torch.cuda.stream(stream), DeferredCollectiveCapture():
         model(list(static_inputs))
-        collectives.wait()
     stream.synchronize()
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
@@ -2349,10 +2348,9 @@ def cudagraphify_impl(
     graph = torch.cuda.CUDAGraph()
     with (
         torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"),
-        PendingCollectiveWaits() as collectives,
+        DeferredCollectiveCapture(),
     ):
         static_outputs = model(list(static_inputs))
-        collectives.wait()
     if not isinstance(static_outputs, (list, tuple)):
         static_outputs = (static_outputs,)
 

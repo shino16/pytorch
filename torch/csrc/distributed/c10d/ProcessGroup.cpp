@@ -433,6 +433,20 @@ class WorkRegistry {
     }
   }
 
+  std::vector<c10::intrusive_ptr<c10d::Work>> registered_works() {
+    std::unique_lock lock(lock_);
+    std::vector<c10::intrusive_ptr<c10d::Work>> works;
+    std::unordered_set<c10d::Work*> seen;
+    for (const auto& [storage, entries] : registry_) {
+      for (const auto& work : entries) {
+        if (seen.insert(work.get()).second) {
+          works.push_back(work);
+        }
+      }
+    }
+    return works;
+  }
+
   size_t get_work_registry_size() {
     std::unique_lock lock(lock_);
     size_t total_size = 0;
@@ -555,6 +569,10 @@ std::vector<at::Tensor> wait_tensors(at::TensorList tensors) {
 
 void unregister_work(const c10::intrusive_ptr<c10d::Work>& work) {
   RankLocal<WorkRegistry>::get().unregister_work(work);
+}
+
+std::vector<c10::intrusive_ptr<c10d::Work>> registered_works() {
+  return RankLocal<WorkRegistry>::get().registered_works();
 }
 
 size_t get_work_registry_size() {

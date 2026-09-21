@@ -49,6 +49,10 @@ C10_EXPORT std::vector<at::Tensor> wait_tensors(at::TensorList tensors);
 //    `wait_tensors()`.
 C10_EXPORT void unregister_work(const c10::intrusive_ptr<c10d::Work>& work);
 
+// Non-consuming snapshot: coalesced outputs can retain the same Work after
+// another output has already been waited on.
+C10_EXPORT std::vector<c10::intrusive_ptr<Work>> registered_works();
+
 C10_EXPORT size_t get_work_registry_size();
 
 C10_EXPORT void set_allow_inflight_collective_as_graph_input(bool value);

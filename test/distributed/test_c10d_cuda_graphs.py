@@ -24,7 +24,7 @@ from torch.testing._internal.common_distributed import (
     MultiProcessTestCase,
     skip_if_lt_x_gpu,
 )
-from torch.testing._internal.common_utils import parametrize, run_tests
+from torch.testing._internal.common_utils import parametrize, run_tests, TEST_WITH_ROCM
 
 
 ASYNC_OPS = (False, True)
@@ -243,7 +243,8 @@ instantiate_backend_tests(
 
 
 @unittest.skipIf(not dist.is_nccl_available(), "NCCL required")
-class NCCLCaptureBoundaryTest(C10dBackendTest, MultiProcessTestCase):
+@unittest.skipIf(TEST_WITH_ROCM, "Cross-capture collective waits require CUDA")
+class NCCLDeferredCollectiveCaptureTest(C10dBackendTest, MultiProcessTestCase):
     backend_name = "nccl-legacy"
 
     @contextlib.contextmanager
@@ -263,6 +264,278 @@ class NCCLCaptureBoundaryTest(C10dBackendTest, MultiProcessTestCase):
         finally:
             for graph in graphs:
                 graph.reset()
+
+    def _warmup_collectives(self):
+        self._init_pg()
+        inp = torch.ones(16, device=self.device)
+        dist.all_reduce(inp)
+        torch.cuda.synchronize()
+        return inp, dist.distributed_c10d._get_default_group().group_name
+
+    def _recorded_events(self, graph):
+        from torch.cuda._utils import _check_cuda_bindings as check, _HAS_CUDA_BINDINGS
+
+        if not _HAS_CUDA_BINDINGS:
+            self.skipTest("cuda.bindings required to inspect captured events")
+        from cuda.bindings import runtime
+
+        raw = graph.raw_cuda_graph()
+        _, count = check(runtime.cudaGraphGetNodes(raw))
+        nodes, _ = check(runtime.cudaGraphGetNodes(raw, numNodes=count))
+        return {
+            int(check(runtime.cudaGraphEventRecordNodeGetEvent(node)))
+            for node in nodes[:count]
+            if check(runtime.cudaGraphNodeGetType(node))
+            == runtime.cudaGraphNodeType.cudaGraphNodeTypeEventRecord
+        }
+
+    @skip_if_lt_x_gpu(2)
+    def test_partially_waited_coalesced(self, device):
+        from torch._inductor.cudagraph_utils import DeferredCollectiveCapture
+
+        inp, group_name = self._warmup_collectives()
+        producer = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(producer), DeferredCollectiveCapture():
+            pending = torch.ops._c10d_functional.all_reduce_coalesced(
+                [inp, inp + 1], "sum", group_name
+            )
+            torch.ops._c10d_functional.wait_tensor(pending[0])
+        # Both outputs share a Work. Waiting on one must not discard the
+        # registration needed by the other output's later wait.
+        self.assertEqual(torch._C._distributed_c10d._get_work_registry_size(), 1)
+        consumer = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(consumer):
+            output = torch.ops._c10d_functional.wait_tensor(pending[1]) + 1
+        for offset in range(5):
+            inp.fill_(self.rank + offset + 1)
+            producer.replay()
+            consumer.replay()
+            total = sum(rank + offset + 2 for rank in range(self.world_size))
+            self.assertEqual(output, torch.full_like(output, total + 1))
+        self.assertEqual(torch._C._distributed_c10d._get_work_registry_size(), 0)
+
+    @skip_if_lt_x_gpu(2)
+    def test_escaping_work_before_waited_work(self, device):
+        from torch._inductor.cudagraph_utils import DeferredCollectiveCapture
+
+        inp, group_name = self._warmup_collectives()
+        producer = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(producer), DeferredCollectiveCapture():
+            pending = torch.ops._c10d_functional.all_reduce(inp, "sum", group_name)
+            local = torch.ops._c10d_functional.all_reduce(inp + 1, "sum", group_name)
+            local = torch.ops._c10d_functional.wait_tensor(local)
+        consumer = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(consumer):
+            output = torch.ops._c10d_functional.wait_tensor(pending) + local
+        for offset in range(5):
+            inp.fill_(self.rank + offset + 1)
+            producer.replay()
+            consumer.replay()
+            total = sum(2 * (rank + offset + 1) + 1 for rank in range(self.world_size))
+            self.assertEqual(output, torch.full_like(output, total))
+
+    @skip_if_lt_x_gpu(2)
+    def test_repeated_storage(self, device):
+        from torch._inductor.cudagraph_utils import DeferredCollectiveCapture
+
+        inp, group_name = self._warmup_collectives()
+        producer = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(producer), DeferredCollectiveCapture():
+            torch.ops._c10d_functional.all_reduce_(inp, "sum", group_name)
+            torch.ops._c10d_functional.all_reduce_(inp, "sum", group_name)
+        consumer = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(consumer):
+            output = torch.ops._c10d_functional.wait_tensor(inp.view(4, 4)) + 1
+        for offset in range(5):
+            inp.fill_(self.rank + offset + 1)
+            producer.replay()
+            consumer.replay()
+            total = self.world_size * sum(
+                rank + offset + 1 for rank in range(self.world_size)
+            )
+            self.assertEqual(output, torch.full_like(output, total + 1))
+        self.assertEqual(torch._C._distributed_c10d._get_work_registry_size(), 0)
+
+    @skip_if_lt_x_gpu(2)
+    def test_fully_waited_has_no_extra_event_records(self, device):
+        from torch._inductor.cudagraph_utils import DeferredCollectiveCapture
+
+        inp, group_name = self._warmup_collectives()
+        graphs = []
+        for deferred in (False, True):
+            graph = torch.cuda.CUDAGraph(keep_graph=True)
+            with (
+                torch.cuda.graph(graph),
+                DeferredCollectiveCapture() if deferred else contextlib.nullcontext(),
+            ):
+                output = torch.ops._c10d_functional.all_reduce(inp, "sum", group_name)
+                torch.ops._c10d_functional.wait_tensor(output)
+            graphs.append(graph)
+        self.assertEqual(
+            len(self._recorded_events(graphs[0])),
+            len(self._recorded_events(graphs[1])),
+        )
+        self.assertEqual(torch._C._distributed_c10d._get_work_registry_size(), 0)
+
+    @skip_if_lt_x_gpu(2)
+    def test_export_preserves_completion_frontiers(self, device):
+        from torch._inductor.cudagraph_utils import DeferredCollectiveCapture
+        from torch.cuda._utils import _check_cuda_bindings as check, _HAS_CUDA_BINDINGS
+
+        if not _HAS_CUDA_BINDINGS:
+            self.skipTest("cuda.bindings required to inspect graph dependencies")
+        from cuda.bindings import runtime
+
+        def nodes(graph):
+            _, count = check(runtime.cudaGraphGetNodes(graph))
+            result, _ = check(runtime.cudaGraphGetNodes(graph, numNodes=count))
+            return {int(node) for node in result[:count]}
+
+        inp, group_name = self._warmup_collectives()
+        producer = torch.cuda.CUDAGraph(keep_graph=True)
+        with torch.cuda.graph(producer):
+            stream = torch.cuda.current_stream().cuda_stream
+            with DeferredCollectiveCapture():
+                first = torch.ops._c10d_functional.all_reduce(inp, "sum", group_name)
+                raw = check(runtime.cudaStreamGetCaptureInfo(stream))[2]
+                early_nodes = nodes(raw)
+                second = torch.ops._c10d_functional.all_reduce(inp, "sum", group_name)
+                before_export = nodes(raw)
+                frontier = {
+                    int(node)
+                    for node in check(runtime.cudaStreamGetCaptureInfo(stream))[3]
+                }
+            self.assertEqual(
+                frontier,
+                {
+                    int(node)
+                    for node in check(runtime.cudaStreamGetCaptureInfo(stream))[3]
+                },
+            )
+            records = [
+                node
+                for node in nodes(raw) - before_export
+                if check(runtime.cudaGraphNodeGetType(node))
+                == runtime.cudaGraphNodeType.cudaGraphNodeTypeEventRecord
+            ]
+            self.assertEqual(len(records), 2)
+            completion_frontiers = []
+            for node in records:
+                count = check(runtime.cudaGraphNodeGetDependencies(node))[-1]
+                dependencies = check(
+                    runtime.cudaGraphNodeGetDependencies(node, pNumDependencies=count)
+                )[0]
+                completion_frontiers.append({int(dep) for dep in dependencies[:count]})
+            # Exactly the first completion record uses the earlier graph prefix.
+            # Exporting both against the terminal NCCL frontier would add a wait
+            # on the later collective to the first result's eventual consumer.
+            self.assertEqual(
+                sum(
+                    bool(deps) and deps <= early_nodes for deps in completion_frontiers
+                ),
+                1,
+            )
+        consumer = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(consumer):
+            output = torch.ops._c10d_functional.wait_tensor(first)
+            output = output + torch.ops._c10d_functional.wait_tensor(second)
+        producer.replay()
+        consumer.replay()
+        self.assertEqual(output, torch.full_like(output, 2 * self.world_size**2))
+
+    @skip_if_lt_x_gpu(2)
+    def test_waited_temporary_storage_released(self, device):
+        from torch._inductor.cudagraph_utils import DeferredCollectiveCapture
+        from torch.multiprocessing.reductions import StorageWeakRef
+
+        inp, group_name = self._warmup_collectives()
+        for deferred in (False, True):
+            graph = torch.cuda.CUDAGraph()
+            with (
+                torch.cuda.graph(graph),
+                DeferredCollectiveCapture() if deferred else contextlib.nullcontext(),
+            ):
+                for _ in range(3):
+                    temporary = torch.ops._c10d_functional.all_reduce(
+                        inp, "sum", group_name
+                    )
+                    storage = StorageWeakRef(temporary.untyped_storage())
+                    torch.ops._c10d_functional.wait_tensor(temporary)
+                    del temporary
+                    self.assertTrue(storage.expired())
+
+    @skip_if_lt_x_gpu(2)
+    def test_exception_cleanup(self, device):
+        from torch._inductor.cudagraph_utils import DeferredCollectiveCapture
+
+        inp, group_name = self._warmup_collectives()
+        producer = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(producer):
+            with self.assertRaisesRegex(RuntimeError, "scope failed"):
+                with DeferredCollectiveCapture():
+                    waited = torch.ops._c10d_functional.all_reduce(
+                        inp, "sum", group_name
+                    )
+                    torch.ops._c10d_functional.wait_tensor(waited)
+                    raise RuntimeError("scope failed")
+            # A failed scope must leave no active native scope behind.
+            with DeferredCollectiveCapture():
+                pending = torch.ops._c10d_functional.all_reduce(inp, "sum", group_name)
+        consumer = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(consumer):
+            output = torch.ops._c10d_functional.wait_tensor(pending) + 1
+        producer.replay()
+        consumer.replay()
+        self.assertEqual(output, torch.full_like(output, self.world_size**2 + 1))
+
+    @skip_if_lt_x_gpu(2)
+    @parametrize("release_owner", ["producer", "consumer"])
+    def test_cross_stream_replay_and_event_lifetime(self, device, release_owner):
+        from torch._inductor.cudagraph_utils import DeferredCollectiveCapture
+
+        inp, group_name = self._warmup_collectives()
+
+        def capture(wait_inside):
+            graph = torch.cuda.CUDAGraph(keep_graph=True)
+            with torch.cuda.graph(graph), DeferredCollectiveCapture():
+                pending = torch.ops._c10d_functional.all_reduce(inp, "sum", group_name)
+                if wait_inside:
+                    torch.ops._c10d_functional.wait_tensor(pending)
+            return graph, pending
+
+        reference, _ = capture(True)
+        shared_events = self._recorded_events(reference)
+        producer, pending = capture(False)
+        events = self._recorded_events(producer) - shared_events
+        self.assertEqual(len(events), 1)
+        consumer = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(consumer):
+            output = torch.ops._c10d_functional.wait_tensor(pending) + 1
+        replay_stream = torch.cuda.Stream()
+        for offset in range(5):
+            inp.fill_(self.rank + offset + 1)
+            replay_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(replay_stream):
+                producer.replay()
+            consumer.replay()
+            total = sum(rank + offset + 1 for rank in range(self.world_size))
+            self.assertEqual(output, torch.full_like(output, total + 1))
+        torch.cuda.synchronize()
+        if release_owner == "producer":
+            producer.reset()
+        else:
+            consumer.reset()
+        del pending
+        # Either graph must keep the external event alive independently of Work.
+        graphs = []
+        for _ in range(16):
+            graph, pending = capture(False)
+            self.assertTrue(events.isdisjoint(self._recorded_events(graph)))
+            graphs.append(graph)
+            wait_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(wait_graph):
+                torch.ops._c10d_functional.wait_tensor(pending)
+            graphs.append(wait_graph)
 
     @skip_if_lt_x_gpu(2)
     @parametrize("trees", [False, True])
@@ -304,7 +577,8 @@ class NCCLCaptureBoundaryTest(C10dBackendTest, MultiProcessTestCase):
     @skip_if_lt_x_gpu(2)
     @parametrize("trees", [False, True])
     @parametrize("coalesced", [False, True])
-    def test_eager_wait(self, device, trees, coalesced):
+    @parametrize("cpp_wrapper", [False, True])
+    def test_eager_wait(self, device, trees, coalesced, cpp_wrapper):
         from torch._dynamo.utils import counters
         from torch._inductor import config
 
@@ -326,7 +600,15 @@ class NCCLCaptureBoundaryTest(C10dBackendTest, MultiProcessTestCase):
         skips_before = counters["inductor"]["cudagraph_skips"]
         try:
             with (
-                config.patch("triton.cudagraph_trees", trees),
+                config.patch(
+                    {
+                        "triton.cudagraph_trees": trees,
+                        "cpp_wrapper": cpp_wrapper,
+                        "graph_partition": False
+                        if cpp_wrapper
+                        else config.graph_partition,
+                    }
+                ),
                 contextlib.nullcontext() if trees else self._release_legacy_graphs(),
             ):
                 compiled = torch.compile(model, fullgraph=True, mode="reduce-overhead")
@@ -580,7 +862,9 @@ class NCCLCaptureBoundaryTest(C10dBackendTest, MultiProcessTestCase):
             torch._dynamo.reset()
 
 
-instantiate_device_type_tests(NCCLCaptureBoundaryTest, globals(), only_for="cuda")
+instantiate_device_type_tests(
+    NCCLDeferredCollectiveCaptureTest, globals(), only_for="cuda"
+)
 
 
 if __name__ == "__main__":

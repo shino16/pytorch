@@ -4,13 +4,12 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Callable
 from enum import Enum
-from typing import Any, Literal, TYPE_CHECKING, TypeVar
+from typing import Any, Literal, Self, TYPE_CHECKING, TypeVar
 
 import torch
 from torch._dynamo.utils import counters, get_metrics_context
 from torch._inductor.utils import GraphPartitionMap, InputType
 from torch._subclasses.fake_tensor import get_plain_tensors, is_fake
-from torch.utils import _pytree as pytree
 from torch.utils._ordered_set import OrderedSet
 from torch.utils._python_dispatch import TorchDispatchMode
 
@@ -36,46 +35,48 @@ OutputType = list[int | torch.Tensor | None]
 ModelType = Callable[[list[InputType]], OutputType]
 
 
-class PendingCollectiveWaits(TorchDispatchMode):
-    """Join functional collectives launched during this CUDA graph capture."""
+class DeferredCollectiveCapture(TorchDispatchMode):
+    """Export pending capture events, or consume discarded eager warmup Work.
+
+    Native tracking also observes C++ wrapper calls that bypass Python dispatch.
+    Higher-order operators are excluded because child captures own their scopes.
+    """
 
     def __init__(self) -> None:
         super().__init__()
         self.supports_higher_order_operators = True
-        self.pending: dict[int, torch.Tensor] = {}
+        native = getattr(torch._C, "_distributed_c10d", None)
+        self.native = native if hasattr(native, "_begin_collective_capture") else None
+
+    def __enter__(self) -> Self:
+        super().__enter__()
+        try:
+            if self.native is not None:
+                self.native._begin_collective_capture()
+        except BaseException:
+            super().__exit__(None, None, None)
+            raise
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        try:
+            if self.native is not None:
+                self.native._end_collective_capture(exc_type is None)
+        finally:
+            super().__exit__(exc_type, exc_value, traceback)
 
     def __torch_dispatch__(
         self, func: Any, types: Any, args: Any = (), kwargs: Any = None
     ) -> Any:
-        result = func(*args, **(kwargs or {}))
-        # Child control-flow captures have their own boundaries. Forward their
-        # higher-order operator with this mode popped, without tracking its body.
-        if isinstance(func, torch._ops.HigherOrderOperator):
-            return result
-        if func.namespace == "_c10d_functional" and func not in (
-            torch.ops._c10d_functional.isend.default,
-            torch.ops._c10d_functional.irecv.default,
-            torch.ops._c10d_functional.batch_p2p_ops.default,
-        ):
-            if func in (
-                torch.ops._c10d_functional.wait_tensor.default,
-                torch.ops._c10d_functional.wait_tensors.default,
-            ):
-                for tensor in pytree.tree_leaves(args):
-                    if isinstance(tensor, torch.Tensor):
-                        self.pending.pop(tensor.untyped_storage()._cdata, None)
-            else:
-                for tensor in pytree.tree_leaves(result):
-                    if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
-                        self.pending[tensor.untyped_storage()._cdata] = tensor
-        return result
-
-    def wait(self) -> None:
-        # Wait at the end, after independent compute has been recorded. These
-        # waits consume registered Work, making later waits outside capture no-ops.
-        for tensor in list(self.pending.values()):
-            torch.ops._c10d_functional.wait_tensor(tensor)
-        self.pending.clear()
+        # Higher-order operators run with this mode popped. Child captures own
+        # their scopes; their launches must not be attributed to the parent.
+        if self.native is None or not isinstance(func, torch._ops.HigherOrderOperator):
+            return func(*args, **(kwargs or {}))
+        previous = self.native._set_collective_capture_enabled(False)
+        try:
+            return func(*args, **(kwargs or {}))
+        finally:
+            self.native._set_collective_capture_enabled(previous)
 
 
 _CUDAGRAPH_SUPPORTED_DEVICE_TYPES = frozenset(OrderedSet(["cuda"]))
