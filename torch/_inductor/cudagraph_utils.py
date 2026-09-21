@@ -10,7 +10,9 @@ import torch
 from torch._dynamo.utils import counters, get_metrics_context
 from torch._inductor.utils import GraphPartitionMap, InputType
 from torch._subclasses.fake_tensor import get_plain_tensors, is_fake
+from torch.utils import _pytree as pytree
 from torch.utils._ordered_set import OrderedSet
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from . import config
 from .utils import is_using_cudagraph_partition
@@ -32,6 +34,49 @@ static_inputs_log = torch._logging.getArtifactLogger(
 
 OutputType = list[int | torch.Tensor | None]
 ModelType = Callable[[list[InputType]], OutputType]
+
+
+class PendingCollectiveWaits(TorchDispatchMode):
+    """Join functional collectives launched during this CUDA graph capture."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.supports_higher_order_operators = True
+        self.pending: dict[int, torch.Tensor] = {}
+
+    def __torch_dispatch__(
+        self, func: Any, types: Any, args: Any = (), kwargs: Any = None
+    ) -> Any:
+        result = func(*args, **(kwargs or {}))
+        # Child control-flow captures have their own boundaries. Forward their
+        # higher-order operator with this mode popped, without tracking its body.
+        if isinstance(func, torch._ops.HigherOrderOperator):
+            return result
+        if func.namespace == "_c10d_functional" and func not in (
+            torch.ops._c10d_functional.isend.default,
+            torch.ops._c10d_functional.irecv.default,
+            torch.ops._c10d_functional.batch_p2p_ops.default,
+        ):
+            if func in (
+                torch.ops._c10d_functional.wait_tensor.default,
+                torch.ops._c10d_functional.wait_tensors.default,
+            ):
+                for tensor in pytree.tree_leaves(args):
+                    if isinstance(tensor, torch.Tensor):
+                        self.pending.pop(tensor.untyped_storage()._cdata, None)
+            else:
+                for tensor in pytree.tree_leaves(result):
+                    if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
+                        self.pending[tensor.untyped_storage()._cdata] = tensor
+        return result
+
+    def wait(self) -> None:
+        # Wait at the end, after independent compute has been recorded. These
+        # waits consume registered Work, making later waits outside capture no-ops.
+        for tensor in list(self.pending.values()):
+            torch.ops._c10d_functional.wait_tensor(tensor)
+        self.pending.clear()
+
 
 _CUDAGRAPH_SUPPORTED_DEVICE_TYPES = frozenset(OrderedSet(["cuda"]))
 

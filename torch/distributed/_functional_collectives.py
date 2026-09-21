@@ -1526,17 +1526,6 @@ def _maybe_wrap_tensors(tensors: list[torch.Tensor]) -> list[torch.Tensor]:
 
 
 @contextlib.contextmanager
-def _allow_collective_wait_outside_capture():
-    """Enable cross-capture completion events for launches in this thread's scope."""
-    set_enabled = torch._C._distributed_c10d._set_allow_collective_wait_outside_capture
-    previous = set_enabled(True)
-    try:
-        yield
-    finally:
-        set_enabled(previous)
-
-
-@contextlib.contextmanager
 def allow_inflight_collective_as_graph_input_ctx(value: bool = True):
     """
     Context manager to temporarily set whether inflight collectives are allowed as torch.compile graph inputs.

@@ -14,9 +14,7 @@ class TORCH_API CUDAEventCache
     : public std::enable_shared_from_this<CUDAEventCache> {
  public:
   CUDAEventCache();
-  std::shared_ptr<at::cuda::CUDAEvent> create(
-      bool timing,
-      bool external = false);
+  std::shared_ptr<at::cuda::CUDAEvent> create(bool timing);
   static std::shared_ptr<CUDAEventCache> get(at::DeviceIndex device);
 
  private:
@@ -24,8 +22,8 @@ class TORCH_API CUDAEventCache
   // NOTE: We intentionally store raw pointers so that
   // we do not attempt to destroy the event objects on process exit,
   // because cuda may be gone.
-  // Indexed by [timing][external].
-  std::array<std::array<std::deque<at::cuda::CUDAEvent*>, 2>, 2> eventsArray_;
+  std::array<std::deque<at::cuda::CUDAEvent*>, 2>
+      eventsArray_; // 0 for timing=false, 1 for timing=true
 };
 
 } // namespace c10d
