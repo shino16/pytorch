@@ -52,7 +52,10 @@ class PendingCollectiveWaits(TorchDispatchMode):
         # higher-order operator with this mode popped, without tracking its body.
         if isinstance(func, torch._ops.HigherOrderOperator):
             return result
-        if func.namespace == "_c10d_functional" and func not in (
+        if func.namespace in (
+            "_c10d_functional",
+            "_c10d_functional_autograd",
+        ) and func not in (
             torch.ops._c10d_functional.isend.default,
             torch.ops._c10d_functional.irecv.default,
             torch.ops._c10d_functional.batch_p2p_ops.default,

@@ -350,6 +350,67 @@ class NCCLCaptureBoundaryTest(C10dBackendTest, MultiProcessTestCase):
             torch._dynamo.reset()
 
     @skip_if_lt_x_gpu(2)
+    @parametrize("trees", [False, True])
+    @parametrize("collective", ["all_gather", "reduce_scatter", "all_to_all"])
+    def test_eager_wait_compat_namespace(self, device, trees, collective):
+        from torch._dynamo.utils import counters
+        from torch._inductor import config
+
+        self._init_pg()
+        group_name = dist.distributed_c10d._get_default_group().group_name
+        ops = torch.ops._c10d_functional_autograd
+
+        def model(inp):
+            if collective == "all_gather":
+                return ops.all_gather_into_tensor(inp, self.world_size, group_name)
+            if collective == "reduce_scatter":
+                return ops.reduce_scatter_tensor(
+                    inp, "sum", self.world_size, group_name
+                )
+            splits = [8] * self.world_size
+            return ops.all_to_all_single(inp, splits, splits, group_name)
+
+        torch._dynamo.reset()
+        skips_before = counters["inductor"]["cudagraph_skips"]
+        try:
+            with (
+                config.patch("triton.cudagraph_trees", trees),
+                contextlib.nullcontext() if trees else self._release_legacy_graphs(),
+            ):
+                compiled = torch.compile(model, fullgraph=True, mode="reduce-overhead")
+                for offset in range(6):
+                    torch.compiler.cudagraph_mark_step_begin()
+                    inp = torch.full(
+                        (8 * self.world_size,),
+                        self.rank + offset + 1.0,
+                        device=self.device,
+                    )
+                    pending = compiled(inp)
+                    waited = torch.ops._c10d_functional.wait_tensor(pending)
+                    if collective == "reduce_scatter":
+                        total = sum(
+                            rank + offset + 1 for rank in range(self.world_size)
+                        )
+                        expected = torch.full_like(waited, total)
+                    else:
+                        chunk = inp.numel() if collective == "all_gather" else 8
+                        expected = torch.cat(
+                            [
+                                torch.full(
+                                    (chunk,), rank + offset + 1.0, device=self.device
+                                )
+                                for rank in range(self.world_size)
+                            ]
+                        )
+                    self.assertEqual(waited, expected)
+                    self.assertEqual(
+                        torch._C._distributed_c10d._get_work_registry_size(), 0
+                    )
+                self.assertEqual(counters["inductor"]["cudagraph_skips"], skips_before)
+        finally:
+            torch._dynamo.reset()
+
+    @skip_if_lt_x_gpu(2)
     @parametrize("return_alias", [False, True])
     def test_mutated_input(self, device, return_alias):
         from torch._inductor.cudagraph_trees import cudagraphify_impl
