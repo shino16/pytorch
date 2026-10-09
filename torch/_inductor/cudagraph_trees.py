@@ -87,6 +87,7 @@ from torch._inductor.cudagraph_utils import (
     maybe_warning_due_to_dynamic_shape,
     ModelType,
     OutputType,
+    PendingCollectiveWaits,
     PlaceholderInfo,
     WrappedFunction,
 )
@@ -828,8 +829,10 @@ class CUDAWarmupNode:
             _update_current_stream_external_object(),
             ControlFlowOpWarmupDispatchMode(),
             get_history_recording(),
+            PendingCollectiveWaits() as collectives,
         ):
             out = self.wrapped_function.model(new_inputs)
+            collectives.wait()
 
         # We need to know which outputs are allocated within the cudagraph pool
         # so that we can deallocate them at the beginning of the next cudagraph step,
@@ -1540,8 +1543,10 @@ class CUDAGraphNode:
             _update_current_stream_external_object(),
             CUDAGraphCaptureControlFlowOpDispatchMode(),
             get_history_recording(),
+            PendingCollectiveWaits() as collectives,
         ):
             static_outputs = model(inputs)
+            collectives.wait()
 
         # running model should reclaim memory
         if len(inputs) != 0:
