@@ -37,15 +37,17 @@ ModelType = Callable[[list[InputType]], OutputType]
 
 
 class PendingCollectiveWaits(TorchDispatchMode):
-    """Wait for functional collectives that a CUDA graph capture leaves pending.
+    """Wait for functional collectives that CUDA graph warmup or capture leaves pending.
 
     Tracks the results of ``_c10d_functional`` and ``_c10d_functional_autograd``
-    collectives dispatched while recording, and ``wait()`` waits for any that the
-    model did not. This consumes their Work, so a later ``wait_tensor`` on those
-    outputs does nothing: a consumer on another stream must first wait for the
-    stream that replays the graph. Point-to-point ops are not tracked, nor are
-    collectives dispatched from inside another operator (higher-order operator
-    bodies, custom op implementations) or by C shims that bypass the dispatcher.
+    collectives dispatched while warming up or recording, and ``wait()`` waits for
+    any that the model did not. This consumes their Work, so a later
+    ``wait_tensor`` on those outputs does nothing, after an eager warmup run as
+    after a graph replay: a consumer on another stream must first wait for the
+    stream that called the compiled function. Point-to-point ops are not tracked,
+    nor are collectives dispatched from inside another operator (higher-order
+    operator bodies, custom op implementations) or by C shims that bypass the
+    dispatcher.
     """
 
     @classmethod
@@ -87,9 +89,9 @@ class PendingCollectiveWaits(TorchDispatchMode):
         return result
 
     def wait(self) -> None:
-        # Wait at the end, after independent compute has been recorded. These
-        # waits consume registered Work, making later waits outside capture
-        # no-ops that no longer order the calling stream.
+        # Wait at the end, after independent compute has been issued. These
+        # waits consume registered Work, making later waits no-ops that no
+        # longer order the calling stream.
         for tensor in list(self.pending.values()):
             torch.ops._c10d_functional.wait_tensor(tensor)
         self.pending.clear()

@@ -829,8 +829,10 @@ class CUDAWarmupNode:
             _update_current_stream_external_object(),
             ControlFlowOpWarmupDispatchMode(),
             get_history_recording(),
+            PendingCollectiveWaits() as collectives,
         ):
             out = self.wrapped_function.model(new_inputs)
+            collectives.wait()
 
         # We need to know which outputs are allocated within the cudagraph pool
         # so that we can deallocate them at the beginning of the next cudagraph step,

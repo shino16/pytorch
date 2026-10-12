@@ -261,7 +261,8 @@ class AbstractCaptureBoundaryTest(C10dBackendTest):
                 graph.reset()
 
     @parametrize("trees", [False, True])
-    def test_graph_break(self, trees):
+    @parametrize("collective", ["all_reduce", "all_gather"])
+    def test_graph_break(self, trees, collective):
         from torch._dynamo.utils import counters
         from torch._inductor import config
 
@@ -269,11 +270,18 @@ class AbstractCaptureBoundaryTest(C10dBackendTest):
         group_name = dist.distributed_c10d._get_default_group().group_name
 
         def model(inp):
-            pending = torch.ops._c10d_functional.all_reduce(inp, "sum", group_name)
+            if collective == "all_gather":
+                # The pending gather holds an input allocated in the graph.
+                pending = torch.ops._c10d_functional.all_gather_into_tensor(
+                    inp * 2, self.world_size, group_name
+                )
+            else:
+                pending = torch.ops._c10d_functional.all_reduce(inp, "sum", group_name)
             torch._dynamo.graph_break()
             waited = torch.ops._c10d_functional.wait_tensor(pending)
             return waited.view(4, 4)[:, :2] + 1
 
+        numel = 16 // self.world_size if collective == "all_gather" else 16
         torch._dynamo.reset()
         skips_before = counters["inductor"]["cudagraph_skips"]
         try:
@@ -285,13 +293,25 @@ class AbstractCaptureBoundaryTest(C10dBackendTest):
                 for offset in range(6):
                     torch.compiler.cudagraph_mark_step_begin()
                     inp = torch.full(
-                        (16,), self.rank + offset + 1.0, device=self.device
+                        (numel,), self.rank + offset + 1.0, device=self.device
                     )
-                    total = sum(rank + offset + 1 for rank in range(self.world_size))
-                    self.assertEqual(
-                        compiled(inp),
-                        torch.full((4, 2), total + 1.0, device=self.device),
-                    )
+                    if collective == "all_gather":
+                        expected = torch.cat(
+                            [
+                                torch.full(
+                                    (numel,),
+                                    2.0 * (rank + offset + 1),
+                                    device=self.device,
+                                )
+                                for rank in range(self.world_size)
+                            ]
+                        )
+                    else:
+                        total = sum(
+                            rank + offset + 1 for rank in range(self.world_size)
+                        )
+                        expected = torch.full((16,), float(total), device=self.device)
+                    self.assertEqual(compiled(inp), expected.view(4, 4)[:, :2] + 1)
                     self.assertEqual(
                         torch._C._distributed_c10d._get_work_registry_size(), 0
                     )
@@ -357,6 +377,8 @@ class AbstractCaptureBoundaryTest(C10dBackendTest):
         ops = torch.ops._c10d_functional_autograd
 
         def model(inp):
+            # The pending collective holds an input allocated in the graph.
+            inp = inp * 2
             if collective == "all_gather":
                 return ops.all_gather_into_tensor(inp, self.world_size, group_name)
             if collective == "reduce_scatter":
@@ -385,7 +407,7 @@ class AbstractCaptureBoundaryTest(C10dBackendTest):
                     waited = torch.ops._c10d_functional.wait_tensor(pending)
                     if collective == "reduce_scatter":
                         total = sum(
-                            rank + offset + 1 for rank in range(self.world_size)
+                            2 * (rank + offset + 1) for rank in range(self.world_size)
                         )
                         expected = torch.full_like(waited, total)
                     else:
@@ -393,7 +415,9 @@ class AbstractCaptureBoundaryTest(C10dBackendTest):
                         expected = torch.cat(
                             [
                                 torch.full(
-                                    (chunk,), rank + offset + 1.0, device=self.device
+                                    (chunk,),
+                                    2.0 * (rank + offset + 1),
+                                    device=self.device,
                                 )
                                 for rank in range(self.world_size)
                             ]
