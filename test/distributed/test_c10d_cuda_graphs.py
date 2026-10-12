@@ -656,6 +656,31 @@ class AbstractCaptureBoundaryTest(C10dBackendTest):
         finally:
             torch._dynamo.reset()
 
+    def test_unseen_wait_releases_output(self):
+        from torch._inductor.cudagraph_utils import PendingCollectiveWaits
+        from torch.multiprocessing.reductions import StorageWeakRef
+        from torch.utils._python_dispatch import _disable_current_modes
+
+        self._init_pg()
+        group_name = dist.distributed_c10d._get_default_group().group_name
+        inp = torch.full((16,), self.rank + 1.0, device=self.device)
+        with PendingCollectiveWaits() as collectives:
+            waited = torch.ops._c10d_functional.all_gather_into_tensor(
+                inp, self.world_size, group_name
+            )
+            # cpp_wrapper waits through a C shim that bypasses the dispatcher.
+            with _disable_current_modes():
+                torch.ops._c10d_functional.wait_tensor(waited)
+            waited_ref = StorageWeakRef(waited.untyped_storage())
+            pending = torch.ops._c10d_functional.all_reduce(inp, "sum", group_name)
+            pending_ref = StorageWeakRef(pending.untyped_storage())
+            del waited, pending
+            self.assertTrue(waited_ref.expired())
+            # The registered Work keeps an unwaited output alive.
+            self.assertFalse(pending_ref.expired())
+            collectives.wait()
+        self.assertEqual(torch._C._distributed_c10d._get_work_registry_size(), 0)
+
 
 # nccl-lazy delegates collectives to its primary ProcessGroupNCCL.
 instantiate_backend_tests(
