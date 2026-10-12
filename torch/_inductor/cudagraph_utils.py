@@ -10,7 +10,9 @@ import torch
 from torch._dynamo.utils import counters, get_metrics_context
 from torch._inductor.utils import GraphPartitionMap, InputType
 from torch._subclasses.fake_tensor import get_plain_tensors, is_fake
+from torch.utils import _pytree as pytree
 from torch.utils._ordered_set import OrderedSet
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from . import config
 from .utils import is_using_cudagraph_partition
@@ -32,6 +34,66 @@ static_inputs_log = torch._logging.getArtifactLogger(
 
 OutputType = list[int | torch.Tensor | None]
 ModelType = Callable[[list[InputType]], OutputType]
+
+
+class PendingCollectiveWaits(TorchDispatchMode):
+    """Wait for functional collectives that a CUDA graph capture leaves pending.
+
+    Tracks the results of ``_c10d_functional`` and ``_c10d_functional_autograd``
+    collectives dispatched while recording, and ``wait()`` waits for any that the
+    model did not. This consumes their Work, so a later ``wait_tensor`` on those
+    outputs does nothing: a consumer on another stream must first wait for the
+    stream that replays the graph. Point-to-point ops are not tracked, nor are
+    collectives dispatched from inside another operator (higher-order operator
+    bodies, custom op implementations) or by C shims that bypass the dispatcher.
+    """
+
+    @classmethod
+    def ignore_compile_internals(cls) -> bool:
+        return True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.supports_higher_order_operators = True
+        self.pending: dict[int, torch.Tensor] = {}
+
+    def __torch_dispatch__(
+        self, func: Any, types: Any, args: Any = (), kwargs: Any = None
+    ) -> Any:
+        result = func(*args, **(kwargs or {}))
+        # The operator ran with this mode popped, so collectives inside a
+        # higher-order operator's body were not tracked.
+        if isinstance(func, torch._ops.HigherOrderOperator):
+            return result
+        if func.namespace in (
+            "_c10d_functional",
+            "_c10d_functional_autograd",
+        ) and func not in (
+            torch.ops._c10d_functional.isend.default,
+            torch.ops._c10d_functional.irecv.default,
+            torch.ops._c10d_functional.batch_p2p_ops.default,
+        ):
+            if func in (
+                torch.ops._c10d_functional.wait_tensor.default,
+                torch.ops._c10d_functional.wait_tensors.default,
+            ):
+                for tensor in pytree.tree_leaves(args):
+                    if isinstance(tensor, torch.Tensor):
+                        self.pending.pop(tensor.untyped_storage()._cdata, None)
+            else:
+                for tensor in pytree.tree_leaves(result):
+                    if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
+                        self.pending[tensor.untyped_storage()._cdata] = tensor
+        return result
+
+    def wait(self) -> None:
+        # Wait at the end, after independent compute has been recorded. These
+        # waits consume registered Work, making later waits outside capture
+        # no-ops that no longer order the calling stream.
+        for tensor in list(self.pending.values()):
+            torch.ops._c10d_functional.wait_tensor(tensor)
+        self.pending.clear()
+
 
 _CUDAGRAPH_SUPPORTED_DEVICE_TYPES = frozenset(OrderedSet(["cuda"]))
 
