@@ -10,6 +10,7 @@ import torch
 from torch._dynamo.utils import counters, get_metrics_context
 from torch._inductor.utils import GraphPartitionMap, InputType
 from torch._subclasses.fake_tensor import get_plain_tensors, is_fake
+from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils import _pytree as pytree
 from torch.utils._ordered_set import OrderedSet
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -57,7 +58,9 @@ class PendingCollectiveWaits(TorchDispatchMode):
     def __init__(self) -> None:
         super().__init__()
         self.supports_higher_order_operators = True
-        self.pending: dict[int, torch.Tensor] = {}
+        # Weak, so that a wait this mode cannot see, such as cpp_wrapper's C
+        # shim, still frees the output. Pending Work keeps its outputs alive.
+        self.pending: dict[int, StorageWeakRef] = {}
 
     def __torch_dispatch__(
         self, func: Any, types: Any, args: Any = (), kwargs: Any = None
@@ -85,15 +88,19 @@ class PendingCollectiveWaits(TorchDispatchMode):
             else:
                 for tensor in pytree.tree_leaves(result):
                     if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
-                        self.pending[tensor.untyped_storage()._cdata] = tensor
+                        storage = tensor.untyped_storage()
+                        self.pending[storage._cdata] = StorageWeakRef(storage)
         return result
 
     def wait(self) -> None:
         # Wait at the end, after independent compute has been issued. These
         # waits consume registered Work, making later waits no-ops that no
         # longer order the calling stream.
-        for tensor in list(self.pending.values()):
-            torch.ops._c10d_functional.wait_tensor(tensor)
+        for ref in list(self.pending.values()):
+            storage = torch.UntypedStorage._new_with_weak_ptr(ref.cdata)
+            if storage is not None:
+                tensor = torch.empty(0, dtype=torch.uint8, device=storage.device)
+                torch.ops._c10d_functional.wait_tensor(tensor.set_(storage))
         self.pending.clear()
 
 
