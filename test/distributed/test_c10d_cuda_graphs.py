@@ -2,7 +2,6 @@
 
 import contextlib
 import sys
-import unittest
 from unittest import mock
 
 import torch
@@ -19,12 +18,11 @@ from c10d_backend_common import (
     instantiate_backend_tests,
 )
 
-from torch.testing._internal.common_device_type import instantiate_device_type_tests
-from torch.testing._internal.common_distributed import (
-    MultiProcessTestCase,
-    skip_if_lt_x_gpu,
+from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
+    run_tests,
 )
-from torch.testing._internal.common_utils import parametrize, run_tests
 
 
 ASYNC_OPS = (False, True)
@@ -242,10 +240,8 @@ instantiate_backend_tests(
 )
 
 
-@unittest.skipIf(not dist.is_nccl_available(), "NCCL required")
-class NCCLCaptureBoundaryTest(C10dBackendTest, MultiProcessTestCase):
-    backend_name = "nccl-legacy"
-
+@instantiate_parametrized_tests
+class AbstractCaptureBoundaryTest(C10dBackendTest):
     @contextlib.contextmanager
     def _release_legacy_graphs(self):
         # NCCL shutdown requires captured graphs to be released, even if a
@@ -264,9 +260,8 @@ class NCCLCaptureBoundaryTest(C10dBackendTest, MultiProcessTestCase):
             for graph in graphs:
                 graph.reset()
 
-    @skip_if_lt_x_gpu(2)
     @parametrize("trees", [False, True])
-    def test_graph_break(self, device, trees):
+    def test_graph_break(self, trees):
         from torch._dynamo.utils import counters
         from torch._inductor import config
 
@@ -297,14 +292,16 @@ class NCCLCaptureBoundaryTest(C10dBackendTest, MultiProcessTestCase):
                         compiled(inp),
                         torch.full((4, 2), total + 1.0, device=self.device),
                     )
+                    self.assertEqual(
+                        torch._C._distributed_c10d._get_work_registry_size(), 0
+                    )
                 self.assertEqual(counters["inductor"]["cudagraph_skips"], skips_before)
         finally:
             torch._dynamo.reset()
 
-    @skip_if_lt_x_gpu(2)
     @parametrize("trees", [False, True])
     @parametrize("coalesced", [False, True])
-    def test_eager_wait(self, device, trees, coalesced):
+    def test_eager_wait(self, trees, coalesced):
         from torch._dynamo.utils import counters
         from torch._inductor import config
 
@@ -349,10 +346,9 @@ class NCCLCaptureBoundaryTest(C10dBackendTest, MultiProcessTestCase):
         finally:
             torch._dynamo.reset()
 
-    @skip_if_lt_x_gpu(2)
     @parametrize("trees", [False, True])
     @parametrize("collective", ["all_gather", "reduce_scatter", "all_to_all"])
-    def test_eager_wait_compat_namespace(self, device, trees, collective):
+    def test_eager_wait_compat_namespace(self, trees, collective):
         from torch._dynamo.utils import counters
         from torch._inductor import config
 
@@ -410,9 +406,8 @@ class NCCLCaptureBoundaryTest(C10dBackendTest, MultiProcessTestCase):
         finally:
             torch._dynamo.reset()
 
-    @skip_if_lt_x_gpu(2)
     @parametrize("return_alias", [False, True])
-    def test_mutated_input(self, device, return_alias):
+    def test_mutated_input(self, return_alias):
         from torch._inductor.cudagraph_trees import cudagraphify_impl
 
         self._init_pg()
@@ -450,8 +445,7 @@ class NCCLCaptureBoundaryTest(C10dBackendTest, MultiProcessTestCase):
         finally:
             torch._dynamo.reset()
 
-    @skip_if_lt_x_gpu(2)
-    def test_compiled_mixed_static_dynamic_partitions(self, device):
+    def test_compiled_mixed_static_dynamic_partitions(self):
         import ast
 
         from torch._dynamo.utils import counters
@@ -543,8 +537,7 @@ class NCCLCaptureBoundaryTest(C10dBackendTest, MultiProcessTestCase):
         finally:
             torch._dynamo.reset()
 
-    @skip_if_lt_x_gpu(2)
-    def test_partition_intermediate_mutation(self, device):
+    def test_partition_intermediate_mutation(self):
         from torch._dynamo.utils import counters
         from torch._inductor.utils import run_and_get_code
 
@@ -593,9 +586,8 @@ class NCCLCaptureBoundaryTest(C10dBackendTest, MultiProcessTestCase):
         finally:
             torch._dynamo.reset()
 
-    @skip_if_lt_x_gpu(2)
     @parametrize("trees", [False, True])
-    def test_readonly_input_preserves_pending_work(self, device, trees):
+    def test_readonly_input_preserves_pending_work(self, trees):
         from torch._inductor.compile_fx import cudagraphify_impl as legacy_capture
         from torch._inductor.cudagraph_trees import cudagraphify_impl as tree_capture
 
@@ -641,7 +633,13 @@ class NCCLCaptureBoundaryTest(C10dBackendTest, MultiProcessTestCase):
             torch._dynamo.reset()
 
 
-instantiate_device_type_tests(NCCLCaptureBoundaryTest, globals(), only_for="cuda")
+# nccl-lazy delegates collectives to its primary ProcessGroupNCCL.
+instantiate_backend_tests(
+    globals(),
+    "CaptureBoundary",
+    AbstractCaptureBoundaryTest,
+    tuple(b for b in CUDA_BACKENDS if b.name in ("nccl-legacy", "nccl2")),
+)
 
 
 if __name__ == "__main__":
