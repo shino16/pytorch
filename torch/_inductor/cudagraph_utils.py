@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable
+import functools
+from collections.abc import Callable, Iterable
 from enum import Enum
 from typing import Any, Literal, TYPE_CHECKING, TypeVar
 
@@ -42,13 +43,18 @@ class PendingCollectiveWaits(TorchDispatchMode):
 
     Tracks the results of ``_c10d_functional`` and ``_c10d_functional_autograd``
     collectives dispatched while warming up or recording, and ``wait()`` waits for
-    any that the model did not. This consumes their Work, so a later
-    ``wait_tensor`` on those outputs does nothing, after an eager warmup run as
-    after a graph replay: a consumer on another stream must first wait for the
-    stream that called the compiled function. Point-to-point ops are not tracked,
-    nor are collectives dispatched from inside another operator (higher-order
-    operator bodies, custom op implementations) or by C shims that bypass the
-    dispatcher.
+    any that the model did not. This consumes their Work, so after a graph is
+    recorded or replayed, a later ``wait_tensor`` on those outputs does nothing:
+    a consumer on another stream must first wait for the stream that called the
+    graph. After an eager warmup run, ``register_completion()`` registers Work in
+    place of the consumed Work, so a later ``wait_tensor`` still orders the
+    waiting stream after the collective, as in eager mode. Under
+    ``allow_inflight_collective_as_graph_input_ctx``, waiting one output of an
+    eager coalesced collective also unregisters the others, which the
+    replacement Work cannot do: it stays registered on an output that is never
+    waited, one entry per warmup run. Point-to-point ops are not tracked, nor are
+    collectives dispatched from inside another operator (higher-order operator
+    bodies, custom op implementations) or by C shims that bypass the dispatcher.
     """
 
     @classmethod
@@ -61,6 +67,7 @@ class PendingCollectiveWaits(TorchDispatchMode):
         # Weak, so that a wait this mode cannot see, such as cpp_wrapper's C
         # shim, still frees the output. Pending Work keeps its outputs alive.
         self.pending: dict[int, StorageWeakRef] = {}
+        self.waited: list[StorageWeakRef] = []
 
     def __torch_dispatch__(
         self, func: Any, types: Any, args: Any = (), kwargs: Any = None
@@ -93,15 +100,93 @@ class PendingCollectiveWaits(TorchDispatchMode):
         return result
 
     def wait(self) -> None:
-        # Wait at the end, after independent compute has been issued. These
-        # waits consume registered Work, making later waits no-ops that no
-        # longer order the calling stream.
-        for ref in list(self.pending.values()):
-            storage = torch.UntypedStorage._new_with_weak_ptr(ref.cdata)
-            if storage is not None:
-                tensor = torch.empty(0, dtype=torch.uint8, device=storage.device)
-                torch.ops._c10d_functional.wait_tensor(tensor.set_(storage))
+        # Wait at the end, after independent compute has been issued.
+        if not self.pending:
+            return
+        c10d = torch._C._distributed_c10d
+        # The waits below run under this mode and remove keys from pending.
+        pending = list(self.pending.items())
+        consumed: OrderedSet[int] = OrderedSet()
+        # With allow_inflight_collective_as_graph_input set, waiting one
+        # output of a coalesced Work also unregisters it from the others, so
+        # their own waits would show no registry drop. The flag, like the Work
+        # these waits pop and the registry size read below, belongs to the
+        # calling thread's c10d Work registry (autograd threads share their
+        # forward thread's), so other threads do not see the change.
+        allow_inflight = c10d._allow_inflight_collective_as_graph_input()
+        c10d._set_allow_inflight_collective_as_graph_input(False)
+        try:
+            for key, ref in pending:
+                tensor = _tensor_from_weak_storage(ref)
+                if tensor is None:
+                    continue
+                size = c10d._get_work_registry_size()
+                torch.ops._c10d_functional.wait_tensor(tensor)
+                # A wait this mode could not see, such as cpp_wrapper's C
+                # shim, already consumed the Work; there is nothing to replace.
+                if c10d._get_work_registry_size() < size:
+                    consumed.add(key)
+        finally:
+            c10d._set_allow_inflight_collective_as_graph_input(allow_inflight)
+        self.waited = [ref for key, ref in pending if key in consumed]
         self.pending.clear()
+
+    def register_completion(self) -> None:
+        """Register Work for the storages ``wait()`` waited for, after an eager run.
+
+        A replay cannot do the same: a later CUDA graph that waits on its
+        outputs waits only while it is recorded, so Work registered on every
+        replay would accumulate.
+        """
+        register_collective_completion(_alive_tensors(self.waited))
+
+
+def register_collective_completion(tensors: list[torch.Tensor]) -> None:
+    """Make a later ``wait_tensor`` on ``tensors`` wait for the current stream.
+
+    This replaces the collective Work that ``PendingCollectiveWaits`` consumed.
+    The current stream has already waited for the collective, so a stream that
+    waits for it is ordered after the collective. As with the consumed Work, the
+    entry stays registered until a ``wait_tensor`` on the tensor's storage.
+    """
+    if not tensors:
+        return
+    work = _stream_completion_work_type()(tensors[0].device)
+    for tensor in tensors:
+        torch._C._distributed_c10d._register_work(tensor, work)
+
+
+@functools.cache
+def _stream_completion_work_type() -> type:
+    class StreamCompletionWork(torch.distributed.Work):
+        def __init__(self, device: torch.device) -> None:
+            super().__init__()
+            self.device = device
+            self.event = torch.cuda.Event()
+            self.event.record(torch.cuda.current_stream(device))
+
+        def wait(self, timeout: object = None) -> bool:
+            with torch.cuda.device(self.device):
+                # A CUDA graph recorded after the eager run needs no
+                # dependency: capture starts after a device synchronize, and
+                # replays follow the launch stream like any other graph input.
+                if not torch.cuda.is_current_stream_capturing():
+                    torch.cuda.current_stream().wait_event(self.event)
+            return True
+
+    return StreamCompletionWork
+
+
+def _tensor_from_weak_storage(ref: StorageWeakRef) -> torch.Tensor | None:
+    storage = torch.UntypedStorage._new_with_weak_ptr(ref.cdata)
+    if storage is None:
+        return None
+    return torch.empty(0, dtype=torch.uint8, device=storage.device).set_(storage)
+
+
+def _alive_tensors(refs: Iterable[StorageWeakRef]) -> list[torch.Tensor]:
+    tensors = [_tensor_from_weak_storage(ref) for ref in refs]
+    return [tensor for tensor in tensors if tensor is not None]
 
 
 _CUDAGRAPH_SUPPORTED_DEVICE_TYPES = frozenset(OrderedSet(["cuda"]))

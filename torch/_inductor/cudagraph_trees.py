@@ -833,6 +833,7 @@ class CUDAWarmupNode:
         ):
             out = self.wrapped_function.model(new_inputs)
             collectives.wait()
+            collectives.register_completion()
 
         # We need to know which outputs are allocated within the cudagraph pool
         # so that we can deallocate them at the beginning of the next cudagraph step,

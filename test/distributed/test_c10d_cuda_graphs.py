@@ -366,6 +366,134 @@ class AbstractCaptureBoundaryTest(C10dBackendTest):
         finally:
             torch._dynamo.reset()
 
+    @parametrize(
+        "target", ["output", "mutated_input", "coalesced", "coalesced_inflight"]
+    )
+    def test_warmup_cross_stream_wait(self, target):
+        from torch._inductor import config
+        from torch._inductor.cudagraph_trees import cudagraphify_impl
+        from torch.distributed._functional_collectives import (
+            allow_inflight_collective_as_graph_input_ctx,
+        )
+
+        self._init_pg()
+        group_name = dist.distributed_c10d._get_default_group().group_name
+
+        def model(args):
+            (inp,) = args
+            args.clear()
+            # Warmup synchronizes on entry, so delay inside the run: a consumer
+            # not ordered after the collective then reads it early.
+            torch.cuda._sleep(100_000_000)
+            if target == "output":
+                return (
+                    torch.ops._c10d_functional.all_reduce(inp * 2, "sum", group_name),
+                )
+            if target.startswith("coalesced"):
+                return tuple(
+                    torch.ops._c10d_functional.all_reduce_coalesced(
+                        [inp * 3, inp * 2], "sum", group_name
+                    )
+                )
+            inp.mul_(2)
+            torch.ops._c10d_functional.all_reduce_(inp, "sum", group_name)
+            return ()
+
+        torch._dynamo.reset()
+        consumer = torch.cuda.Stream()
+        try:
+            with (
+                config.patch("triton.force_cudagraphs_warmup", True),
+                # Waiting one output of a coalesced Work also unregisters it
+                # from the other outputs.
+                allow_inflight_collective_as_graph_input_ctx(
+                    target == "coalesced_inflight"
+                ),
+            ):
+                inp = torch.ones(16, device=self.device)
+                num_outputs = {"output": 1, "mutated_input": 0}.get(target, 2)
+                captured = cudagraphify_impl(
+                    model,
+                    [inp],
+                    static_input_idxs=(0,),
+                    mutated_input_idxs=(0,) if target == "mutated_input" else (),
+                    device_index=self.rank,
+                    is_backward=False,
+                    is_inference=True,
+                    stack_traces=[None] * num_outputs,
+                )
+                for offset in range(6):
+                    torch.compiler.cudagraph_mark_step_begin()
+                    inp.fill_(self.rank + offset + 1)
+                    outputs = captured([inp])
+                    # For coalesced collectives, wait on an output other than
+                    # the first.
+                    pending = outputs[-1] if outputs else inp
+                    with torch.cuda.stream(consumer):
+                        waited = torch.ops._c10d_functional.wait_tensor(pending)
+                        result = waited.clone()
+                    torch.cuda.current_stream().wait_stream(consumer)
+                    for output in outputs[:-1]:
+                        torch.ops._c10d_functional.wait_tensor(output)
+                    total = sum(
+                        2 * (rank + offset + 1) for rank in range(self.world_size)
+                    )
+                    self.assertEqual(result, torch.full_like(result, total))
+                    self.assertEqual(
+                        torch._C._distributed_c10d._get_work_registry_size(), 0
+                    )
+        finally:
+            torch._dynamo.reset()
+
+    def test_warmup_work_waited_in_later_capture(self):
+        from torch._inductor.cudagraph_trees import cudagraphify_impl
+
+        self._init_pg()
+        group_name = dist.distributed_c10d._get_default_group().group_name
+
+        def producer(args):
+            (inp,) = args
+            args.clear()
+            torch.ops._c10d_functional.all_reduce_(inp, "sum", group_name)
+            return ()
+
+        def consumer(args):
+            (inp,) = args
+            args.clear()
+            return (torch.ops._c10d_functional.wait_tensor(inp) * 2,)
+
+        torch._dynamo.reset()
+        try:
+            inp = torch.ones(16, device=self.device)
+            options = dict(
+                static_input_idxs=(0,),
+                device_index=self.rank,
+                is_backward=False,
+                is_inference=True,
+            )
+            produce = cudagraphify_impl(
+                producer, [inp], mutated_input_idxs=(0,), stack_traces=[], **options
+            )
+            consume = cudagraphify_impl(consumer, [inp], stack_traces=[None], **options)
+            torch.compiler.cudagraph_mark_step_begin()
+            consume([inp])
+            for step in range(6):
+                # A warmup run of the producer can be followed by a recording
+                # of the consumer, which waits on the replacement Work while
+                # capturing.
+                torch.compiler.cudagraph_mark_step_begin()
+                inp.fill_(step + 1)
+                produce([inp])
+                torch.compiler.cudagraph_mark_step_begin()
+                (out,) = consume([inp])
+                expected = 2.0 * self.world_size * (step + 1)
+                self.assertEqual(out, torch.full_like(out, expected))
+                self.assertEqual(
+                    torch._C._distributed_c10d._get_work_registry_size(), 0
+                )
+        finally:
+            torch._dynamo.reset()
+
     @parametrize("trees", [False, True])
     @parametrize("collective", ["all_gather", "reduce_scatter", "all_to_all"])
     def test_eager_wait_compat_namespace(self, trees, collective):
@@ -668,9 +796,11 @@ class AbstractCaptureBoundaryTest(C10dBackendTest):
             waited = torch.ops._c10d_functional.all_gather_into_tensor(
                 inp, self.world_size, group_name
             )
+            kept = torch.ops._c10d_functional.all_reduce(inp, "sum", group_name)
             # cpp_wrapper waits through a C shim that bypasses the dispatcher.
             with _disable_current_modes():
                 torch.ops._c10d_functional.wait_tensor(waited)
+                torch.ops._c10d_functional.wait_tensor(kept)
             waited_ref = StorageWeakRef(waited.untyped_storage())
             pending = torch.ops._c10d_functional.all_reduce(inp, "sum", group_name)
             pending_ref = StorageWeakRef(pending.untyped_storage())
@@ -679,6 +809,67 @@ class AbstractCaptureBoundaryTest(C10dBackendTest):
             # The registered Work keeps an unwaited output alive.
             self.assertFalse(pending_ref.expired())
             collectives.wait()
+            # Only consumed Work is replaced: an already waited output that is
+            # still alive gets none.
+            collectives.register_completion()
+        self.assertEqual(torch._C._distributed_c10d._get_work_registry_size(), 0)
+
+    @parametrize("inflight", [False, True])
+    def test_shim_waited_outputs_get_no_replacement(self, inflight):
+        from torch._inductor.cudagraph_utils import PendingCollectiveWaits
+        from torch.distributed._functional_collectives import (
+            allow_inflight_collective_as_graph_input_ctx,
+        )
+        from torch.utils._python_dispatch import _disable_current_modes
+
+        self._init_pg()
+        group_name = dist.distributed_c10d._get_default_group().group_name
+        inp = torch.full((16,), self.rank + 1.0, device=self.device)
+        with (
+            allow_inflight_collective_as_graph_input_ctx(inflight),
+            PendingCollectiveWaits() as collectives,
+        ):
+            first, second = torch.ops._c10d_functional.all_reduce_coalesced(
+                [inp, inp + 1], "sum", group_name
+            )
+            # cpp_wrapper waits through a C shim that bypasses the dispatcher.
+            with _disable_current_modes():
+                torch.ops._c10d_functional.wait_tensor(first)
+                torch.ops._c10d_functional.wait_tensor(second)
+            torch.ops._c10d_functional.all_reduce_(first, "sum", group_name)
+            collectives.wait()
+            collectives.register_completion()
+        # Only the in-place collective's Work was consumed and replaced.
+        self.assertEqual(torch._C._distributed_c10d._get_work_registry_size(), 1)
+        torch.ops._c10d_functional.wait_tensor(first)
+        self.assertEqual(torch._C._distributed_c10d._get_work_registry_size(), 0)
+
+    def test_coalesced_group_survives_storage_reuse(self):
+        from torch._inductor.cudagraph_utils import PendingCollectiveWaits
+        from torch.distributed._functional_collectives import (
+            allow_inflight_collective_as_graph_input_ctx,
+        )
+
+        self._init_pg()
+        group_name = dist.distributed_c10d._get_default_group().group_name
+        shared = torch.full((16,), self.rank + 1.0, device=self.device)
+        sibling = torch.full((16,), self.rank + 2.0, device=self.device)
+        with (
+            allow_inflight_collective_as_graph_input_ctx(),
+            PendingCollectiveWaits() as collectives,
+        ):
+            torch.ops._c10d_functional.all_reduce_coalesced_(
+                [shared, sibling], "sum", group_name
+            )
+            # A later collective returns the same storage before any wait.
+            torch.ops._c10d_functional.all_reduce_(shared, "sum", group_name)
+            collectives.wait()
+            collectives.register_completion()
+        # Waiting the shared storage also unregistered the coalesced Work from
+        # the sibling, which must still get replacement Work.
+        self.assertEqual(torch._C._distributed_c10d._get_work_registry_size(), 2)
+        torch.ops._c10d_functional.wait_tensor(shared)
+        torch.ops._c10d_functional.wait_tensor(sibling)
         self.assertEqual(torch._C._distributed_c10d._get_work_registry_size(), 0)
 
 
