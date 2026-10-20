@@ -2366,6 +2366,7 @@ def cudagraphify_impl(
         collectives.wait()
     if not isinstance(static_outputs, (list, tuple)):
         static_outputs = (static_outputs,)
+    collective_outputs = collectives.captured_outputs(static_outputs)
 
     if config.size_asserts:
 
@@ -2397,6 +2398,8 @@ def cudagraphify_impl(
                     index_expanded_dims_and_copy_(dst, src, expanded_dims)
             new_inputs.clear()
             graph.replay()
+            if collective_outputs is not None:
+                collective_outputs.register_completion(static_outputs)
             # pyrefly: ignore [bad-return]
             return static_outputs
 
@@ -2416,6 +2419,8 @@ def cudagraphify_impl(
                 index_expanded_dims_and_copy_(static_inputs[idx], src, expanded_dims)
             new_inputs.clear()
             graph.replay()
+            if collective_outputs is not None:
+                collective_outputs.register_completion(static_outputs)
             # pyrefly: ignore [bad-return]
             return static_outputs
 

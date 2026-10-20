@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from enum import Enum
 from typing import Any, Literal, TYPE_CHECKING, TypeVar
 
@@ -67,7 +67,7 @@ class PendingCollectiveWaits(TorchDispatchMode):
         # Weak, so that a wait this mode cannot see, such as cpp_wrapper's C
         # shim, still frees the output. Pending Work keeps its outputs alive.
         self.pending: dict[int, StorageWeakRef] = {}
-        self.waited: list[StorageWeakRef] = []
+        self.waited: dict[int, StorageWeakRef] = {}
 
     def __torch_dispatch__(
         self, func: Any, types: Any, args: Any = (), kwargs: Any = None
@@ -128,17 +128,89 @@ class PendingCollectiveWaits(TorchDispatchMode):
                     consumed.add(key)
         finally:
             c10d._set_allow_inflight_collective_as_graph_input(allow_inflight)
-        self.waited = [ref for key, ref in pending if key in consumed]
+        self.waited = {key: ref for key, ref in pending if key in consumed}
         self.pending.clear()
 
     def register_completion(self) -> None:
-        """Register Work for the storages ``wait()`` waited for, after an eager run.
+        """Register Work for the storages ``wait()`` waited for, after an eager run."""
+        register_collective_completion(_alive_tensors(self.waited.values()))
 
-        A replay cannot do the same: a later CUDA graph that waits on its
-        outputs waits only while it is recorded, so Work registered on every
-        replay would accumulate.
-        """
-        register_collective_completion(_alive_tensors(self.waited))
+    def captured_outputs(
+        self, outputs: Sequence[object]
+    ) -> CapturedCollectiveOutputs | None:
+        """Describe where a recorded graph's waited storages reappear after replay."""
+        if not self.waited:
+            return None
+        return CapturedCollectiveOutputs(self.waited, outputs)
+
+
+class CapturedCollectiveOutputs:
+    """Storages of a recorded graph whose pending collectives the capture waited for.
+
+    After each replay, ``register_completion`` registers Work for them, so a
+    later ``wait_tensor`` orders the waiting stream after the replay. Inductor
+    runs a ``wait_tensor`` on a collective from another graph outside CUDA
+    graphs, so that wait runs on every call and pops this Work. A wait that pops
+    it while another graph is recorded is ordered by the stream that launches
+    both graphs instead, and would never pop it again, so registration for that
+    storage stops. Replays can return new output tensors, so outputs are kept
+    by index; other storages that outlive the capture, such as a static input
+    mutated in place, are kept by weak reference.
+    """
+
+    def __init__(
+        self, waited: dict[int, StorageWeakRef], outputs: Sequence[object]
+    ) -> None:
+        self.output_idxs = OrderedSet(
+            i
+            for i, out in enumerate(outputs)
+            if isinstance(out, torch.Tensor) and out.untyped_storage()._cdata in waited
+        )
+        output_keys = OrderedSet(
+            outputs[i].untyped_storage()._cdata  # type: ignore[union-attr]
+            for i in self.output_idxs
+        )
+        self.other_storages = {
+            key: ref
+            for key, ref in waited.items()
+            if key not in output_keys and not ref.expired()
+        }
+
+    def register_completion(self, outputs: Sequence[object]) -> None:
+        """Register Work for this replay's waited storages."""
+        if not self.output_idxs and not self.other_storages:
+            return
+        registrations: list[tuple[torch.Tensor, Callable[[], None]]] = []
+        for i in self.output_idxs:
+            output = outputs[i]
+            if isinstance(output, torch.Tensor):
+                registrations.append((output, self._stop_output(i)))
+        for key, ref in self.other_storages.items():
+            tensor = _tensor_from_weak_storage(ref)
+            if tensor is not None:
+                registrations.append((tensor, self._stop_storage(key)))
+        if not registrations:
+            return
+        device = registrations[0][0].device
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(device))
+        work_type = _stream_completion_work_type()
+        for tensor, stop in registrations:
+            torch._C._distributed_c10d._register_work(
+                tensor, work_type(device, event, stop)
+            )
+
+    def _stop_output(self, i: int) -> Callable[[], None]:
+        def stop() -> None:
+            self.output_idxs.discard(i)
+
+        return stop
+
+    def _stop_storage(self, key: int) -> Callable[[], None]:
+        def stop() -> None:
+            self.other_storages.pop(key, None)
+
+        return stop
 
 
 def register_collective_completion(tensors: list[torch.Tensor]) -> None:
@@ -151,7 +223,10 @@ def register_collective_completion(tensors: list[torch.Tensor]) -> None:
     """
     if not tensors:
         return
-    work = _stream_completion_work_type()(tensors[0].device)
+    device = tensors[0].device
+    event = torch.cuda.Event()
+    event.record(torch.cuda.current_stream(device))
+    work = _stream_completion_work_type()(device, event)
     for tensor in tensors:
         torch._C._distributed_c10d._register_work(tensor, work)
 
@@ -159,18 +234,26 @@ def register_collective_completion(tensors: list[torch.Tensor]) -> None:
 @functools.cache
 def _stream_completion_work_type() -> type:
     class StreamCompletionWork(torch.distributed.Work):
-        def __init__(self, device: torch.device) -> None:
+        def __init__(
+            self,
+            device: torch.device,
+            event: torch.cuda.Event,
+            on_capture: Callable[[], None] | None = None,
+        ) -> None:
             super().__init__()
             self.device = device
-            self.event = torch.cuda.Event()
-            self.event.record(torch.cuda.current_stream(device))
+            self.event = event
+            self.on_capture = on_capture
 
         def wait(self, timeout: object = None) -> bool:
             with torch.cuda.device(self.device):
-                # A CUDA graph recorded after the eager run needs no
-                # dependency: capture starts after a device synchronize, and
-                # replays follow the launch stream like any other graph input.
-                if not torch.cuda.is_current_stream_capturing():
+                # A CUDA graph recorded after the event needs no dependency:
+                # capture starts after a device synchronize, and replays follow
+                # the launch stream like any other graph input.
+                if torch.cuda.is_current_stream_capturing():
+                    if self.on_capture is not None:
+                        self.on_capture()
+                else:
                     torch.cuda.current_stream().wait_event(self.event)
             return True
 

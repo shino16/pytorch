@@ -78,6 +78,7 @@ from torch._inductor.compile_fx import (
     static_input,
 )
 from torch._inductor.cudagraph_utils import (
+    CapturedCollectiveOutputs,
     check_for_mutation,
     CheckInvariantStatus,
     collect_cuda_data_ptrs,
@@ -1211,6 +1212,7 @@ class CUDAGraphNode:
         # are aliases of parameters that are always live.
         self.static_output_tensors: OutputList[Tensor | None] = []
 
+        self.collective_outputs: CapturedCollectiveOutputs | None = None
         # Cleared after recording
         with dynamo_timed_cudagraph("CUDAGraphNode.record", compile_id, mode):
             self.recording_outputs: OutputType | None = self._record(
@@ -1298,6 +1300,8 @@ class CUDAGraphNode:
         self.recording_outputs = None
         if outputs is None:
             raise AssertionError("expected outputs to not be None")
+        if self.collective_outputs is not None:
+            self.collective_outputs.register_completion(outputs)
         return outputs
 
     def run(self, new_inputs: list[InputType]) -> OutputType:
@@ -1317,6 +1321,8 @@ class CUDAGraphNode:
         self.run_graph()
 
         outputs = self.reconstruct_outputs()
+        if self.collective_outputs is not None:
+            self.collective_outputs.register_completion(outputs)
         new_inputs.clear()
 
         if config.triton.fast_path_cudagraph_asserts:
@@ -1555,6 +1561,7 @@ class CUDAGraphNode:
 
         if not isinstance(static_outputs, (list, tuple)):
             static_outputs = (static_outputs,)
+        self.collective_outputs = collectives.captured_outputs(static_outputs)
 
         # pyrefly: ignore [bad-argument-type]
         self._add_first_outputs(static_outputs, static_input_persistent_storage_ptrs)

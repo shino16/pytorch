@@ -366,10 +366,11 @@ class AbstractCaptureBoundaryTest(C10dBackendTest):
         finally:
             torch._dynamo.reset()
 
+    @parametrize("warmup", [True, False])
     @parametrize(
         "target", ["output", "mutated_input", "coalesced", "coalesced_inflight"]
     )
-    def test_warmup_cross_stream_wait(self, target):
+    def test_cross_stream_wait(self, warmup, target):
         from torch._inductor import config
         from torch._inductor.cudagraph_trees import cudagraphify_impl
         from torch.distributed._functional_collectives import (
@@ -382,8 +383,9 @@ class AbstractCaptureBoundaryTest(C10dBackendTest):
         def model(args):
             (inp,) = args
             args.clear()
-            # Warmup synchronizes on entry, so delay inside the run: a consumer
-            # not ordered after the collective then reads it early.
+            # Warmup and recording synchronize on entry, so delay inside the
+            # run: a consumer not ordered after the collective then reads it
+            # early.
             torch.cuda._sleep(100_000_000)
             if target == "output":
                 return (
@@ -403,7 +405,7 @@ class AbstractCaptureBoundaryTest(C10dBackendTest):
         consumer = torch.cuda.Stream()
         try:
             with (
-                config.patch("triton.force_cudagraphs_warmup", True),
+                config.patch("triton.force_cudagraphs_warmup", warmup),
                 # Waiting one output of a coalesced Work also unregisters it
                 # from the other outputs.
                 allow_inflight_collective_as_graph_input_ctx(
@@ -445,7 +447,7 @@ class AbstractCaptureBoundaryTest(C10dBackendTest):
         finally:
             torch._dynamo.reset()
 
-    def test_warmup_work_waited_in_later_capture(self):
+    def test_replacement_waited_while_capturing(self):
         from torch._inductor.cudagraph_trees import cudagraphify_impl
 
         self._init_pg()
@@ -475,22 +477,100 @@ class AbstractCaptureBoundaryTest(C10dBackendTest):
                 producer, [inp], mutated_input_idxs=(0,), stack_traces=[], **options
             )
             consume = cudagraphify_impl(consumer, [inp], stack_traces=[None], **options)
-            torch.compiler.cudagraph_mark_step_begin()
-            consume([inp])
             for step in range(6):
-                # A warmup run of the producer can be followed by a recording
-                # of the consumer, which waits on the replacement Work while
-                # capturing.
+                # Like two partitions of one graph, both are recorded in the
+                # same step, so the consumer pops the producer's replacement
+                # Work while capturing; registration for that storage stops.
                 torch.compiler.cudagraph_mark_step_begin()
                 inp.fill_(step + 1)
                 produce([inp])
-                torch.compiler.cudagraph_mark_step_begin()
                 (out,) = consume([inp])
                 expected = 2.0 * self.world_size * (step + 1)
                 self.assertEqual(out, torch.full_like(out, expected))
                 self.assertEqual(
                     torch._C._distributed_c10d._get_work_registry_size(), 0
                 )
+        finally:
+            torch._dynamo.reset()
+
+    @parametrize("trees", [False, True])
+    def test_cross_stream_graph_consumer(self, trees):
+        from torch._inductor import config
+
+        self._init_pg()
+        group_name = dist.distributed_c10d._get_default_group().group_name
+
+        def produce(x, w):
+            y = x
+            for _ in range(16):
+                y = torch.tanh(y @ w)
+            return torch.ops._c10d_functional.all_reduce(y, "sum", group_name)
+
+        def consume(pending):
+            return torch.ops._c10d_functional.wait_tensor(pending) * 2
+
+        w = torch.eye(2048, device=self.device) * 0.5
+        consumer = torch.cuda.Stream()
+        torch._dynamo.reset()
+        try:
+            with (
+                config.patch("triton.cudagraph_trees", trees),
+                contextlib.nullcontext() if trees else self._release_legacy_graphs(),
+            ):
+                produce_c = torch.compile(produce, mode="reduce-overhead")
+                consume_c = torch.compile(consume, mode="reduce-overhead")
+                for offset in range(6):
+                    torch.compiler.cudagraph_mark_step_begin()
+                    x = torch.full((2048, 2048), offset + 1.0, device=self.device)
+                    pending = produce_c(x, w)
+                    # The consumer graph runs on another stream and relies on
+                    # its wait_tensor alone, as it could in eager mode.
+                    with torch.cuda.stream(consumer):
+                        out = consume_c(pending)
+                    torch.cuda.current_stream().wait_stream(consumer)
+                    y = x
+                    for _ in range(16):
+                        y = torch.tanh(y @ w)
+                    self.assertEqual(out, y * 2 * self.world_size)
+                    self.assertEqual(
+                        torch._C._distributed_c10d._get_work_registry_size(), 0
+                    )
+        finally:
+            torch._dynamo.reset()
+
+    @parametrize("trees", [False, True])
+    def test_eager_collective_waited_in_graph(self, trees):
+        from torch._inductor import config
+
+        self._init_pg()
+        group_name = dist.distributed_c10d._get_default_group().group_name
+
+        def consume(pending):
+            return torch.ops._c10d_functional.wait_tensor(pending) * 2
+
+        torch._dynamo.reset()
+        try:
+            with (
+                config.patch("triton.cudagraph_trees", trees),
+                contextlib.nullcontext() if trees else self._release_legacy_graphs(),
+            ):
+                consume_c = torch.compile(consume, mode="reduce-overhead")
+                for offset in range(6):
+                    torch.compiler.cudagraph_mark_step_begin()
+                    inp = torch.full(
+                        (16,), self.rank + offset + 1.0, device=self.device
+                    )
+                    # Eager Work cannot be waited inside a capture, so the
+                    # wait runs outside the CUDA graph.
+                    pending = torch.ops._c10d_functional.all_reduce(
+                        inp, "sum", group_name
+                    )
+                    out = consume_c(pending)
+                    total = sum(rank + offset + 1 for rank in range(self.world_size))
+                    self.assertEqual(out, torch.full_like(out, 2.0 * total))
+                    self.assertEqual(
+                        torch._C._distributed_c10d._get_work_registry_size(), 0
+                    )
         finally:
             torch._dynamo.reset()
 

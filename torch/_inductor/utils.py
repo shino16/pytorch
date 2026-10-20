@@ -4953,6 +4953,61 @@ def get_op_names(op: torch._ops.OperatorBase) -> tuple[str, str]:
     return op_overload_packet_name, op_overload_name
 
 
+def _waits_on_collective_from_another_graph(fx_node: torch.fx.Node) -> bool:
+    """
+    Check if ``fx_node`` waits on a functional collective launched outside its graph.
+
+    Such a wait reads Work that the producer registered outside this graph, such
+    as eager Work or the Work a CUDA graph registers after each replay. Captured,
+    it would wait only while the graph is recorded; run outside CUDA graphs, it
+    orders the calling stream after the collective on every call, as in eager.
+    """
+    target = fx_node.target
+    if target not in (
+        torch.ops._c10d_functional.wait_tensor.default,
+        torch.ops._c10d_functional.wait_tensors.default,
+    ):
+        return False
+    from torch.multiprocessing.reductions import StorageWeakRef
+
+    def storages(node: object) -> list[StorageWeakRef]:
+        if not isinstance(node, torch.fx.Node):
+            return []
+        val = node.meta.get("val")
+        vals = val if isinstance(val, (list, tuple)) else [val]
+        return [
+            StorageWeakRef(v.untyped_storage())
+            for v in vals
+            if isinstance(v, torch.Tensor)
+        ]
+
+    waited = OrderedSet(
+        ref for arg in pytree.tree_leaves(fx_node.args) for ref in storages(arg)
+    )
+    inputs = OrderedSet(
+        ref
+        for node in fx_node.graph.nodes
+        if node.op == "placeholder"
+        for ref in storages(node)
+    )
+    pending = waited & inputs
+    for node in fx_node.graph.nodes:
+        if node is fx_node:
+            break
+        if (
+            isinstance(node.target, torch._ops.OpOverload)
+            and node.target.namespace
+            in ("_c10d_functional", "_c10d_functional_autograd")
+            and node.target
+            not in (
+                torch.ops._c10d_functional.wait_tensor.default,
+                torch.ops._c10d_functional.wait_tensors.default,
+            )
+        ):
+            pending -= OrderedSet(storages(node))
+    return bool(pending)
+
+
 def _fx_node_is_input_dependent_cudagraph_unsafe(fx_node: torch.fx.Node) -> bool:
     """
     Check if an FX node is cudagraph-unsafe based on its input arguments.
@@ -4966,6 +5021,9 @@ def _fx_node_is_input_dependent_cudagraph_unsafe(fx_node: torch.fx.Node) -> bool
     target = fx_node.target
     if not isinstance(target, torch._ops.OpOverload):
         return False
+
+    if _waits_on_collective_from_another_graph(fx_node):
+        return True
 
     # index_put with boolean indices triggers .nonzero() during capture
     if target in (
