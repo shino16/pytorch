@@ -7172,6 +7172,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 )
 
         elif self.inside_reduction and len(loop_trees) > 0:
+            unroll_factor = (
+                config.triton.reduction_loop_unroll_factor
+                if not torch.version.hip
+                and V.graph.get_current_device_or_throw().type == "cuda"
+                else 1
+            )
             # Write the loop headers.
             for level, tree in enumerate(loop_trees):
                 with self.body.indent(offset=level):
@@ -7186,8 +7192,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                         num_stages = ", num_stages = 2"
                     else:
                         num_stages = ""
+                    unroll = (
+                        f", loop_unroll_factor={unroll_factor}"
+                        if level == len(loop_trees) - 1 and unroll_factor > 1
+                        else ""
+                    )
                     self.body.writeline(
-                        f"for {prefix}offset in tl.range({loop_start}, {loop_end}, {prefix.upper()}BLOCK{num_stages}):"
+                        f"for {prefix}offset in tl.range({loop_start}, {loop_end}, {prefix.upper()}BLOCK{num_stages}{unroll}):"
                     )
                 with self.body.indent(offset=level + 1):
                     self.iteration_ranges_codegen_header(tree, self.body)
