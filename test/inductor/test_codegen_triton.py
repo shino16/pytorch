@@ -159,7 +159,8 @@ class TestCodegenTriton(InductorTestCase):
             self.assertEqual(len(loop_headers), 1)
             if factor > 1:
                 self.assertIn(
-                    f"loop_unroll_factor={factor} if 17920 % R0_BLOCK else None",
+                    f"loop_unroll_factor={factor} if 17920 % R0_BLOCK"
+                    " and XBLOCK * R0_BLOCK <= 1024 else None",
                     loop_headers[0],
                 )
             else:

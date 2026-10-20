@@ -2280,9 +2280,10 @@ class triton:
     )
 
     # Unroll factor for the innermost loop of non-persistent CUDA reductions
-    # whose static size is not a multiple of R0_BLOCK. Values <= 1 disable it.
+    # whose static size is not a multiple of R0_BLOCK, applied to configs with
+    # at most 1024 elements per loop iteration. Values <= 1 disable it.
     reduction_loop_unroll_factor: int = int(
-        os.environ.get("TORCHINDUCTOR_REDUCTION_LOOP_UNROLL_FACTOR", "8")
+        os.environ.get("TORCHINDUCTOR_REDUCTION_LOOP_UNROLL_FACTOR", "4")
     )
 
     # For small output size reductions uses cross thread-block synchronization to gain more parallelism

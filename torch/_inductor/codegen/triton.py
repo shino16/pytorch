@@ -7437,11 +7437,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     def _reduction_loop_unroll_hint(self, tree: IterationRangesRoot) -> str:
         """
-        Unroll hint for the innermost reduction loop. When R0_BLOCK does not
+        Unroll hint for the innermost reduction loop. When the block does not
         divide a static reduction size, the in-loop mask keeps LLVM from
-        unrolling, leaving one load in flight per thread. The condition is a
-        constexpr, so configs whose block divides the size keep LLVM's own
-        unrolling.
+        unrolling, and a small tile then leaves each thread with a single load
+        in flight. The condition is a constexpr, so configs whose block divides
+        the size keep LLVM's own unrolling, and large tiles, which already
+        issue several loads per thread, are left alone.
         """
         factor = config.triton.reduction_loop_unroll_factor
         if (
@@ -7454,8 +7455,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         numel = V.graph.sizevars.simplify(tree.numel)
         if not isinstance(numel, (sympy.Integer, int)):
             return ""
-        block = f"{tree.prefix.upper()}BLOCK"
-        return f", loop_unroll_factor={factor} if {int(numel)} % {block} else None"
+        tile = " * ".join(
+            t.block_size_str() for t in self.range_trees if t.tensor_dim is not None
+        )
+        return (
+            f", loop_unroll_factor={factor} if {int(numel)} % {tree.block_size_str()}"
+            f" and {tile} <= 1024 else None"
+        )
 
     def _get_heuristic(self):
         if self.fixed_config:

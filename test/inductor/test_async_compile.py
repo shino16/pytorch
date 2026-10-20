@@ -438,7 +438,8 @@ def test_flydsl_loader_main(value, stream):
         elif GPU_TYPE == "cuda" and config.triton.reduction_loop_unroll_factor > 1:
             loop_header = (
                 "for r0_offset in tl.range(0, r0_numel, R0_BLOCK, loop_unroll_factor="
-                f"{config.triton.reduction_loop_unroll_factor} if 11776 % R0_BLOCK else None):"
+                f"{config.triton.reduction_loop_unroll_factor} if 11776 % R0_BLOCK"
+                " and XBLOCK * R0_BLOCK <= 1024 else None):"
             )
         else:
             loop_header = "for r0_offset in tl.range(0, r0_numel, R0_BLOCK):"
