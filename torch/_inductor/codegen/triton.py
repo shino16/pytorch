@@ -7172,12 +7172,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 )
 
         elif self.inside_reduction and len(loop_trees) > 0:
-            unroll_factor = (
-                config.triton.reduction_loop_unroll_factor
-                if not torch.version.hip
-                and V.graph.get_current_device_or_throw().type == "cuda"
-                else 1
-            )
             # Write the loop headers.
             for level, tree in enumerate(loop_trees):
                 with self.body.indent(offset=level):
@@ -7193,8 +7187,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     else:
                         num_stages = ""
                     unroll = (
-                        f", loop_unroll_factor={unroll_factor}"
-                        if level == len(loop_trees) - 1 and unroll_factor > 1
+                        self._reduction_loop_unroll_hint(tree)
+                        if level == len(loop_trees) - 1
                         else ""
                     )
                     self.body.writeline(
@@ -7440,6 +7434,28 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             import torch
             """
         ).format(V.graph.device_ops.import_get_raw_stream_as("get_raw_stream"))
+
+    def _reduction_loop_unroll_hint(self, tree: IterationRangesRoot) -> str:
+        """
+        Unroll hint for the innermost reduction loop. When R0_BLOCK does not
+        divide a static reduction size, the in-loop mask keeps LLVM from
+        unrolling, leaving one load in flight per thread. The condition is a
+        constexpr, so configs whose block divides the size keep LLVM's own
+        unrolling.
+        """
+        factor = config.triton.reduction_loop_unroll_factor
+        if (
+            factor <= 1
+            or self.cooperative_reduction
+            or torch.version.hip
+            or V.graph.get_current_device_or_throw().type != "cuda"
+        ):
+            return ""
+        numel = V.graph.sizevars.simplify(tree.numel)
+        if not isinstance(numel, (sympy.Integer, int)):
+            return ""
+        block = f"{tree.prefix.upper()}BLOCK"
+        return f", loop_unroll_factor={factor} if {int(numel)} % {block} else None"
 
     def _get_heuristic(self):
         if self.fixed_config:

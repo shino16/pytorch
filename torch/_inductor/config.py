@@ -2279,10 +2279,8 @@ class triton:
         os.environ.get("TORCHINDUCTOR_DECOMPOSE_SORT_OPS", "0") == "1"
     )
 
-    # Unroll hint for the innermost loop of non-persistent CUDA reductions.
-    # When the reduction size is not a multiple of R0_BLOCK, the in-loop mask
-    # keeps LLVM from unrolling, leaving one load in flight per thread.
-    # Values <= 1 disable the hint.
+    # Unroll factor for the innermost loop of non-persistent CUDA reductions
+    # whose static size is not a multiple of R0_BLOCK. Values <= 1 disable it.
     reduction_loop_unroll_factor: int = int(
         os.environ.get("TORCHINDUCTOR_REDUCTION_LOOP_UNROLL_FACTOR", "8")
     )

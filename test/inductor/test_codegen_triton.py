@@ -140,6 +140,31 @@ class TestCodegenTriton(InductorTestCase):
         self.assertTrue(torch.isnan(actual_max[2]).item())
         self.assertIn("tl.where", " ".join(code))
 
+    @unittest.skipUnless(
+        HAS_GPU_AND_TRITON and GPU_TYPE == "cuda" and not torch.version.hip,
+        "requires CUDA and Triton",
+    )
+    def test_reduction_loop_unroll_factor(self):
+        def fn(x):
+            return x.sum(dim=1)
+
+        # 17920 is not a multiple of R0_BLOCK, so the reduction loop is masked.
+        x = torch.randn(64, 17920, device=GPU_TYPE)
+        for factor in (1, 8):
+            torch._dynamo.reset()
+            with inductor_config.patch({"triton.reduction_loop_unroll_factor": factor}):
+                actual, (code,) = run_and_get_code(torch.compile(fn), x)
+            self.assertEqual(actual, fn(x), atol=1e-3, rtol=1e-5)
+            loop_headers = re.findall(r"for r0_offset in tl\.range\(.*\):", code)
+            self.assertEqual(len(loop_headers), 1)
+            if factor > 1:
+                self.assertIn(
+                    f"loop_unroll_factor={factor} if 17920 % R0_BLOCK else None",
+                    loop_headers[0],
+                )
+            else:
+                self.assertNotIn("loop_unroll_factor", loop_headers[0])
+
     def test_range_tree_entry_ownership_uses_root_identity(self):
         class AlternateR0Root(IterationRangesRoot):
             def block_size(self):
