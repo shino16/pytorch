@@ -431,11 +431,18 @@ def test_flydsl_loader_main(value, stream):
 
         # Fake name to make sure the lookup table is name agnostic
         # When codegen/triton.py is changed, func_def must be updated
-        loop_header = (
-            "for r0_offset in tl.range(0, r0_numel, R0_BLOCK, num_stages = 2):"
-            if torch.version.hip
-            else "for r0_offset in tl.range(0, r0_numel, R0_BLOCK):"
-        )
+        if torch.version.hip:
+            loop_header = (
+                "for r0_offset in tl.range(0, r0_numel, R0_BLOCK, num_stages = 2):"
+            )
+        elif GPU_TYPE == "cuda" and config.triton.reduction_loop_unroll_factor > 1:
+            loop_header = (
+                "for r0_offset in tl.range(0, r0_numel, R0_BLOCK, loop_unroll_factor="
+                f"{config.triton.reduction_loop_unroll_factor} if 11776 % R0_BLOCK"
+                " and XBLOCK * R0_BLOCK <= 1024 else None):"
+            )
+        else:
+            loop_header = "for r0_offset in tl.range(0, r0_numel, R0_BLOCK):"
 
         func_def = f"""
 def triton_fused_fake_name(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK : tl.constexpr, R0_BLOCK : tl.constexpr):

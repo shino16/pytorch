@@ -2279,6 +2279,14 @@ class triton:
         os.environ.get("TORCHINDUCTOR_DECOMPOSE_SORT_OPS", "0") == "1"
     )
 
+    # Unroll factor for the innermost loop of non-persistent CUDA reductions
+    # whose static size is not a multiple of that loop's block size, applied to
+    # configs with at most 1024 elements per loop iteration. Not used on HIP,
+    # for cooperative reductions, or with Triton < 3.3. Values <= 1 disable it.
+    reduction_loop_unroll_factor: int = int(
+        os.environ.get("TORCHINDUCTOR_REDUCTION_LOOP_UNROLL_FACTOR", "4")
+    )
+
     # For small output size reductions uses cross thread-block synchronization to gain more parallelism
     cooperative_reductions = (
         os.environ.get("TORCHINDUCTOR_COOPERATIVE_REDUCTIONS", "0") == "1"

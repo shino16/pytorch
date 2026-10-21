@@ -34,6 +34,7 @@ from torch._inductor.codegen.wrapper import _escape_triton_kernel_source_for_wra
 from torch._inductor.dtype_propagation import DtypePropagationOpsHandler, promote_types
 from torch._inductor.graph import GraphLowering
 from torch._inductor.runtime.hints import AutotuneHint, DeviceProperties
+from torch._inductor.runtime.triton_heuristics import CachingAutotuner
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import (
     get_importable_constexpr_types,
@@ -139,6 +140,97 @@ class TestCodegenTriton(InductorTestCase):
         self.assertTrue(torch.isnan(actual_min[2]).item())
         self.assertTrue(torch.isnan(actual_max[2]).item())
         self.assertIn("tl.where", " ".join(code))
+
+    @unittest.skipUnless(
+        HAS_GPU_AND_TRITON and GPU_TYPE == "cuda" and not torch.version.hip,
+        "requires CUDA and Triton",
+    )
+    def test_reduction_loop_unroll_factor(self):
+        def fn(x):
+            return x.sum(dim=0)
+
+        # An unsplit outer reduction gets a small-tile config on every CUDA
+        # arch, and 17000 is not a multiple of its R0_BLOCK, so the hint is
+        # active and the compiled kernel runs the unrolled loop.
+        x = torch.randn(17000, 1024, device=GPU_TYPE)
+        for factor in (1, 4):
+            torch._dynamo.reset()
+            autotuners = []
+            precompile = CachingAutotuner.precompile
+
+            def capture_precompile(autotuner, *args, **kwargs):
+                autotuners.append(autotuner)
+                return precompile(autotuner, *args, **kwargs)
+
+            with (
+                inductor_config.patch(
+                    {
+                        "split_reductions": False,
+                        "triton.reduction_loop_unroll_factor": factor,
+                    }
+                ),
+                patch.object(CachingAutotuner, "precompile", capture_precompile),
+            ):
+                actual, (code,) = run_and_get_code(torch.compile(fn), x)
+            self.assertEqual(actual, fn(x), atol=1e-3, rtol=1e-4)
+            loop_headers = re.findall(r"for r0_offset in tl\.range\(.*\):", code)
+            self.assertEqual(len(loop_headers), 1)
+            if factor > 1:
+                self.assertIn(
+                    f"loop_unroll_factor={factor} if 17000 % R0_BLOCK"
+                    " and XBLOCK * R0_BLOCK <= 1024 else None",
+                    loop_headers[0],
+                )
+                self.assertEqual(len(autotuners), 1)
+                self.assertEqual(len(autotuners[0].launchers), 1)
+                kwargs = autotuners[0].launchers[0].config.kwargs
+                self.assertNotEqual(17000 % kwargs["R0_BLOCK"], 0)
+                self.assertLessEqual(kwargs["XBLOCK"] * kwargs["R0_BLOCK"], 1024)
+            else:
+                self.assertNotIn("loop_unroll_factor", loop_headers[0])
+
+    @unittest.skipUnless(
+        HAS_GPU_AND_TRITON and GPU_TYPE == "cuda" and not torch.version.hip,
+        "requires CUDA and Triton",
+    )
+    @inductor_config.patch(
+        {
+            "triton.tile_reductions": True,
+            "triton.prefer_nd_tiling": True,
+            "triton.reduction_loop_unroll_factor": 4,
+        }
+    )
+    def test_reduction_loop_unroll_factor_innermost_loop_only(self):
+        def fn(x):
+            return x[:, :, :250].sum((1, 2))
+
+        x = torch.randn(64, 300, 512, device=GPU_TYPE)
+        actual, codes = run_and_get_code(torch.compile(fn), x)
+        self.assertEqual(actual, fn(x), atol=1e-3, rtol=1e-4)
+        code = "\n".join(codes)
+        r0_headers = re.findall(r"for r0_offset in tl\.range\(.*\):", code)
+        r1_headers = re.findall(r"for r1_offset in tl\.range\(.*\):", code)
+        self.assertEqual(len(r0_headers), 1)
+        self.assertEqual(len(r1_headers), 1)
+        self.assertNotIn("loop_unroll_factor", r0_headers[0])
+        self.assertIn("loop_unroll_factor=4 if 250 % R1_BLOCK", r1_headers[0])
+
+    @unittest.skipUnless(
+        HAS_GPU_AND_TRITON and GPU_TYPE == "cuda" and not torch.version.hip,
+        "requires CUDA and Triton",
+    )
+    @inductor_config.patch({"triton.reduction_loop_unroll_factor": 4})
+    def test_reduction_loop_unroll_factor_dynamic_size(self):
+        def fn(x):
+            return x.sum(dim=1)
+
+        x = torch.randn(64, 17920, device=GPU_TYPE)
+        torch._dynamo.mark_dynamic(x, 1)
+        actual, codes = run_and_get_code(torch.compile(fn), x)
+        self.assertEqual(actual, fn(x), atol=1e-3, rtol=1e-4)
+        code = "\n".join(codes)
+        self.assertRegex(code, r"for r0_offset in tl\.range\(")
+        self.assertNotIn("loop_unroll_factor", code)
 
     def test_range_tree_entry_ownership_uses_root_identity(self):
         class AlternateR0Root(IterationRangesRoot):

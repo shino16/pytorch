@@ -7186,8 +7186,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                         num_stages = ", num_stages = 2"
                     else:
                         num_stages = ""
+                    unroll = (
+                        self._reduction_loop_unroll_hint(tree)
+                        if level == len(loop_trees) - 1
+                        else ""
+                    )
                     self.body.writeline(
-                        f"for {prefix}offset in tl.range({loop_start}, {loop_end}, {prefix.upper()}BLOCK{num_stages}):"
+                        f"for {prefix}offset in tl.range({loop_start}, {loop_end}, {prefix.upper()}BLOCK{num_stages}{unroll}):"
                     )
                 with self.body.indent(offset=level + 1):
                     self.iteration_ranges_codegen_header(tree, self.body)
@@ -7429,6 +7434,39 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             import torch
             """
         ).format(V.graph.device_ops.import_get_raw_stream_as("get_raw_stream"))
+
+    def _reduction_loop_unroll_hint(self, tree: IterationRangesRoot) -> str:
+        """
+        Unroll hint for the innermost reduction loop. When the block does not
+        divide a static reduction size, the in-loop mask keeps LLVM from
+        unrolling, and a small tile then leaves each thread with a single load
+        in flight. The condition is a constexpr, so configs whose block divides
+        the size keep LLVM's own unrolling, and large tiles, which already
+        issue several loads per thread, are left alone.
+        """
+        factor = config.triton.reduction_loop_unroll_factor
+        # Cooperative reductions are excluded for correctness, not speed: their
+        # loop runs from rsplit_start to rsplit_end, which can be empty with
+        # rsplit_start > rsplit_end, and Triton's unrolled tl.range then still
+        # runs iterations. Triton < 3.3 rejects loop_unroll_factor=None.
+        if (
+            factor <= 1
+            or self.cooperative_reduction
+            or torch.version.hip
+            or V.graph.get_current_device_or_throw().type != "cuda"
+            or get_triton_version() < (3, 3)
+        ):
+            return ""
+        numel = V.graph.sizevars.simplify(tree.numel)
+        if not isinstance(numel, (sympy.Integer, int)):
+            return ""
+        tile = " * ".join(
+            t.block_size_str() for t in self.range_trees if t.tensor_dim is not None
+        )
+        return (
+            f", loop_unroll_factor={factor} if {int(numel)} % {tree.block_size_str()}"
+            f" and {tile} <= 1024 else None"
+        )
 
     def _get_heuristic(self):
         if self.fixed_config:
