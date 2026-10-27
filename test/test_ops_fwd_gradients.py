@@ -73,7 +73,6 @@ class TestFwdGradients(TestGradients):
                 dtypes=(torch.complex64, torch.complex128),
             ),
             skip("as_strided_scatter"),
-            xfail("triangular_solve"),
             skip("svd_lowrank", dtypes=(torch.complex128,)),
             skip("pca_lowrank", dtypes=(torch.complex128,)),
             xfail("polar"),
@@ -179,7 +178,7 @@ class TestFwdGradients(TestGradients):
         )
 
 
-instantiate_device_type_tests(TestFwdGradients, globals())
+instantiate_device_type_tests(TestFwdGradients, globals(), allow_xpu=True)
 
 if __name__ == "__main__":
     TestCase._default_dtype_check_enabled = True
